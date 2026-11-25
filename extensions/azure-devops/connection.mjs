@@ -32,6 +32,17 @@ export function connectionPreferencePath() {
     return join(homedir(), ".copilot", "azure-devops-canvas", "connection.json");
 }
 
+const TENANT_GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EMPTY_TENANT_GUID = "00000000-0000-0000-0000-000000000000";
+
+export function normalizeTenantGuid(value) {
+    const candidate = normalizeString(value).toLowerCase();
+    if (!TENANT_GUID_PATTERN.test(candidate) || candidate === EMPTY_TENANT_GUID) {
+        return "";
+    }
+    return candidate;
+}
+
 // A connection is only meaningful with an organization. Project and repository
 // stay optional: Azure DevOps answers work item, repository, and project queries
 // at organization scope, so requiring a project would make the picker ask for
@@ -41,10 +52,12 @@ export function normalizeConnection(value) {
     if (!organization) {
         return null;
     }
+    const tenantId = normalizeTenantGuid(value?.tenantId);
     return {
         organization,
         project: normalizeString(value?.project),
         repositoryId: normalizeString(value?.repositoryId || value?.repository),
+        ...(tenantId ? { tenantId } : {}),
     };
 }
 
@@ -105,16 +118,60 @@ function persist(record) {
 // a connection lives, so a canvas that reported success on an unwritable home
 // would send the user back to an empty picker on the next load with nothing to
 // explain it, and no way out of that loop.
+function savedTenantForOrganization(record, organization) {
+    const target = normalizeString(organization).toLowerCase();
+    if (!target || !record) {
+        return "";
+    }
+    for (const candidate of [record.lastUsed, record.default]) {
+        if (candidate && candidate.organization.toLowerCase() === target && candidate.tenantId) {
+            return candidate.tenantId;
+        }
+    }
+    return "";
+}
+
 export function writeConnectionPreference(connection, { isDefault = false } = {}) {
     const normalized = normalizeConnection(connection);
     if (!normalized) {
         return readConnectionPreference();
     }
     const record = readConnectionPreference();
+    const preservedTenant = normalized.tenantId || savedTenantForOrganization(record, normalized.organization);
+    const enriched = preservedTenant ? { ...normalized, tenantId: preservedTenant } : normalized;
     return persistOrFail({
-        default: isDefault ? normalized : record.default,
-        lastUsed: normalized,
+        default: isDefault ? enriched : record.default,
+        lastUsed: enriched,
     });
+}
+
+// Updates the cached resource-tenant hint on an already-saved connection when
+// Azure DevOps advertises X-VSS-ResourceTenant. Best-effort: never creates a
+// connection file on its own or fails a live request if disk is read-only.
+export function rememberConnectionTenant(organization, tenantId) {
+    const normalizedOrg = normalizeString(organization).toLowerCase();
+    const normalizedTenant = normalizeTenantGuid(tenantId);
+    if (!normalizedOrg || !normalizedTenant || !existsSync(connectionPreferencePath())) {
+        return;
+    }
+    try {
+        const record = readConnectionPreference();
+        let changed = false;
+        const updateEntry = (entry) => {
+            if (!entry || entry.organization.toLowerCase() !== normalizedOrg || entry.tenantId === normalizedTenant) {
+                return entry;
+            }
+            changed = true;
+            return { ...entry, tenantId: normalizedTenant };
+        };
+        const nextDefault = updateEntry(record.default);
+        const nextLastUsed = updateEntry(record.lastUsed);
+        if (changed) {
+            persist({ default: nextDefault, lastUsed: nextLastUsed });
+        }
+    } catch {
+        // Cached tenant hints are purely an optimization.
+    }
 }
 
 function persistOrFail(record) {
@@ -175,10 +232,13 @@ export function savedConnections(record = readConnectionPreference()) {
 // connection. That keeps every existing deep-link path behaving exactly as it
 // did before connections existed.
 export function resolveConnections({ input, remote, record } = {}) {
+    const resolvedRecord = record || readConnectionPreference();
     const inputConnection = normalizeConnection(input);
     if (inputConnection) {
+        const tenantId = inputConnection.tenantId || savedTenantForOrganization(resolvedRecord, inputConnection.organization);
         return [{
             ...inputConnection,
+            ...(tenantId ? { tenantId } : {}),
             source: CONNECTION_SOURCE_INPUT,
             isDefault: false,
             remote: remote?.isAzureDevOps && sameConnection(remote, inputConnection) ? remote : null,
@@ -194,10 +254,16 @@ export function resolveConnections({ input, remote, record } = {}) {
             return;
         }
         seen.add(key);
-        connections.push({ ...normalized, source, isDefault, remote: attachedRemote });
+        const tenantId = normalized.tenantId || savedTenantForOrganization(resolvedRecord, normalized.organization);
+        connections.push({
+            ...normalized,
+            ...(tenantId ? { tenantId } : {}),
+            source,
+            isDefault,
+            remote: attachedRemote,
+        });
     };
 
-    const resolvedRecord = record || readConnectionPreference();
     const saved = savedConnections(resolvedRecord);
     const isPinned = (connection) => Boolean(resolvedRecord.default && sameConnection(resolvedRecord.default, connection));
     if (remote?.isAzureDevOps) {

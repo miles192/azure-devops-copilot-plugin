@@ -319,3 +319,41 @@ test("a connection that could not be written is reported, not reported as saved"
         (error) => error.code === "azure_devops_connection_write_failed",
     );
 });
+
+test("tenantId hints normalize canonical GUIDs, preserve across project edits, and do not alter connection identity", async () => {
+    const { home, path } = withHome();
+    const {
+        normalizeConnection,
+        normalizeTenantGuid,
+        readConnectionPreference,
+        rememberConnectionTenant,
+        resolveConnections,
+        sameConnection,
+        writeConnectionPreference,
+    } = await loadConnection(home);
+
+    assert.equal(normalizeTenantGuid("22222222-3333-4444-5555-666666666666"), "22222222-3333-4444-5555-666666666666");
+    assert.equal(normalizeTenantGuid("00000000-0000-0000-0000-000000000000"), "", "MSA sentinel GUID is ignored");
+    assert.equal(normalizeTenantGuid("not-a-guid"), "");
+    assert.equal(normalizeConnection({ organization: "contoso", tenantId: "invalid" }).tenantId, undefined);
+
+    rememberConnectionTenant("fabrikam", "22222222-3333-4444-5555-666666666666");
+    assert.equal(existsSync(path), false, "remembering a tenant hint never creates a preference file on its own");
+
+    writeConnectionPreference({ organization: "fabrikam" }, { isDefault: true });
+    rememberConnectionTenant("Fabrikam", "22222222-3333-4444-5555-666666666666");
+    assert.equal(readConnectionPreference().default.tenantId, "22222222-3333-4444-5555-666666666666");
+    assert.equal(readConnectionPreference().lastUsed.tenantId, "22222222-3333-4444-5555-666666666666");
+
+    // Updating the project without resending tenantId keeps the discovered tenant hint.
+    writeConnectionPreference({ organization: "fabrikam", project: "widgets" }, { isDefault: true });
+    assert.equal(readConnectionPreference().default.tenantId, "22222222-3333-4444-5555-666666666666");
+
+    assert.ok(sameConnection(
+        { organization: "fabrikam", project: "widgets", tenantId: "22222222-3333-4444-5555-666666666666" },
+        { organization: "fabrikam", project: "widgets" },
+    ));
+
+    const [resolvedRemote] = resolveConnections({ remote: remote("fabrikam", "widgets") });
+    assert.equal(resolvedRemote.tenantId, "22222222-3333-4444-5555-666666666666");
+});

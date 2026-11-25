@@ -27,6 +27,14 @@
         <button id="signInMicrosoftButton" type="button">Microsoft (work, school, or personal account)</button>
         <button id="signInAgencyButton" class="secondary" type="button" hidden>Agency (AzureAuth)</button>
       </div>
+      <details id="signInTenantDetails" class="sign-in-tenant-details">
+        <summary class="sign-in-tenant-summary">Sign in to a specific directory or organization</summary>
+        <label class="connection-field sign-in-tenant-field">
+          <span class="connection-field-label">Directory tenant or organization</span>
+          <input id="signInTenantInput" class="connection-input" type="text" autocomplete="off" spellcheck="false" placeholder="fabrikam.onmicrosoft.com, tenant ID, or organization">
+          <span class="connection-field-hint">Optional. Targets a guest or B2B Entra directory instead of the default tenant.</span>
+        </label>
+      </details>
       <pre id="authOutput" class="auth-output" hidden></pre>
     </section>
     <div id="canvasContent" hidden>

@@ -27,6 +27,7 @@ const connectionsButton = document.getElementById("connectionsButton");
 const refreshButton = document.getElementById("refreshButton");
 const signInMicrosoftButton = document.getElementById("signInMicrosoftButton");
 const signInAgencyButton = document.getElementById("signInAgencyButton");
+const signInTenantInput = document.getElementById("signInTenantInput");
 const signOutButton = document.getElementById("signOutButton");
 const showLogsButton = document.getElementById("showLogsButton");
 const copyLogsButton = document.getElementById("copyLogsButton");
@@ -180,7 +181,11 @@ async function request(path, options = {}, includeNonce = true) {
                 showSignInSplash();
             }
         }
-        throw new Error(data.message || data.error || "Request failed.");
+        const error = new Error(data.message || data.error || "Request failed.");
+        error.code = data.error || "";
+        if (data.tenantId) error.tenantId = data.tenantId;
+        if (data.organization) error.organization = data.organization;
+        throw error;
     }
     return data;
 }
@@ -214,8 +219,13 @@ function normalizeRemoteName(remote) {
     }
 }
 
-function showStatus(container, message, retry) {
+function showStatus(container, message, retry, extraAction = null) {
     container.replaceChildren(element("div", "status", message));
+    if (extraAction?.onClick) {
+        const actionButton = element("button", "secondary retry-button", extraAction.label || "Sign in to directory");
+        actionButton.addEventListener("click", extraAction.onClick);
+        container.append(actionButton);
+    }
     if (retry) {
         const button = element("button", "secondary retry-button", "Retry");
         button.addEventListener("click", retry);
@@ -298,13 +308,18 @@ function showWorkItemLoading(container, id) {
     container.replaceChildren(shell);
 }
 
-function showPullRequestError(container, message, retry) {
+function showPullRequestError(container, message, retry, extraAction = null) {
     const state = element("section", "pr-load-state pr-error-state");
     state.setAttribute("role", "alert");
     state.append(
         element("h2", "pr-load-state-title", "Pull request could not load"),
         element("p", "pr-load-state-message", message),
     );
+    if (extraAction?.onClick) {
+        const actionButton = element("button", "secondary retry-button", extraAction.label || "Sign in to directory");
+        actionButton.addEventListener("click", extraAction.onClick);
+        state.append(actionButton);
+    }
     const button = element("button", "secondary retry-button", "Retry");
     button.addEventListener("click", retry);
     state.append(button);
@@ -867,17 +882,20 @@ async function finishSilentAuthentication(authProcess) {
     }
 }
 
-async function startAuth(provider) {
+async function startAuth(provider, options = {}) {
     signInMicrosoftButton.disabled = true;
     signInAgencyButton.disabled = true;
     const providerLabel = provider === "microsoft" ? "Microsoft" : "Agency";
+    const payload = { provider };
+    if (options?.tenant) payload.tenant = options.tenant;
+    if (options?.organization) payload.organization = options.organization;
     renderAuthOutput({ provider, status: "running", output: `Starting ${providerLabel} sign-in...` });
     addLog("trace", `Starting ${providerLabel} sign-in.`);
     try {
         let data = await request("/api/auth/start", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ provider }),
+            body: JSON.stringify(payload),
         });
         renderAuthOutput(data.authProcess);
         if (data.authProcess?.status === "running") {
@@ -886,13 +904,17 @@ async function startAuth(provider) {
         if (data.authProcess?.status === "succeeded") {
             addLog("trace", `${providerLabel} sign-in succeeded.`);
             renderAuthOutput(null);
-            await refresh();
-            return;
+            if (!options?.skipRefresh) {
+                await refresh();
+            }
+            return true;
         }
         addLog("error", `${providerLabel} sign-in did not complete successfully.`, data.authProcess?.output || "");
+        return false;
     } catch (error) {
         addLog("error", `${providerLabel} sign-in failed.`, error.message || "");
         renderAuthOutput({ provider, status: "failed", output: error.message || `${providerLabel} sign-in failed.` });
+        return false;
     } finally {
         signInMicrosoftButton.disabled = false;
         signInAgencyButton.disabled = false;
@@ -915,6 +937,32 @@ async function signOut() {
     } finally {
         signOutButton.disabled = false;
     }
+}
+
+function activeAuthProvider() {
+    return AGENCY_AUTH_ENABLED && currentConfig?.auth?.authType === "azureauth"
+        ? "agency"
+        : "microsoft";
+}
+
+async function authorizeTenantAndRefresh({ tenantId = "", organization = "" } = {}) {
+    return startAuth(activeAuthProvider(), {
+        tenant: tenantId,
+        organization,
+    });
+}
+
+function tenantAuthAction(error, fallbackOrganization = "") {
+    if (error?.code !== "azure_devops_tenant_auth_required") {
+        return null;
+    }
+    return {
+        label: "Sign in to directory",
+        onClick: () => authorizeTenantAndRefresh({
+            tenantId: error.tenantId || "",
+            organization: error.organization || fallbackOrganization || "",
+        }),
+    };
 }
 
 // Azure DevOps rejects edits to a completed or abandoned pull request, so the
@@ -1436,7 +1484,12 @@ async function loadWorkItemIntoTab(tab, entry, token) {
         tab.data = null;
         tab.rendered = null;
         addLog("error", "Failed to load work item details.", error.message || "");
-        showStatus(tab.content, error.message || "Unable to load the work item.", () => loadWorkItemIntoTab(tab, entry, tab.token));
+        showStatus(
+            tab.content,
+            error.message || "Unable to load the work item.",
+            () => loadWorkItemIntoTab(tab, entry, tab.token),
+            tenantAuthAction(error, entry?.organization),
+        );
     }
 }
 
@@ -1776,6 +1829,7 @@ async function loadHome() {
             onDelegateWorkItem: enabledFeatures.delegation ? delegateHomeWorkItem : null,
             onOpenWorkItem: openHomeWorkItem,
             onChooseProject: openConnectionPanel,
+            onAuthorizeTenant: (authRequired) => authorizeTenantAndRefresh(authRequired),
         });
         addLog(
             "trace",
@@ -1791,7 +1845,12 @@ async function loadHome() {
     } catch (error) {
         homeLoaded = false;
         addLog("error", "Failed to load the Azure DevOps home overview.", error.message || "");
-        showStatus(homeContent, error.message || "Failed to load your Azure DevOps work.", loadHome);
+        showStatus(
+            homeContent,
+            error.message || "Failed to load your Azure DevOps work.",
+            loadHome,
+            tenantAuthAction(error),
+        );
     }
 }
 
@@ -1823,6 +1882,7 @@ async function loadPullRequestIntoTab(tab, id, token) {
             tab.content,
             error.message || "Unable to load the pull request.",
             () => loadPullRequestIntoTab(tab, id, tab.token),
+            tenantAuthAction(error, entry?.organization),
         );
     }
 }
@@ -1932,29 +1992,46 @@ async function loadConnectionOrganizations() {
         if (!connectionState) {
             return;
         }
-        connectionState.organizations = (data.organizations || []).map((entry) => entry.name);
+        const entries = data.organizations || [];
+        connectionState.organizations = entries.map((entry) => entry.name);
+        connectionState.organizationTenants = new Map(
+            entries
+                .filter((entry) => entry?.name && entry?.tenantId)
+                .map((entry) => [entry.name.toLowerCase(), entry.tenantId]),
+        );
+        const matchedTenant = connectionState.draft.organization
+            ? connectionState.organizationTenants.get(connectionState.draft.organization.toLowerCase()) || ""
+            : "";
+        if (matchedTenant && !connectionState.draft.tenantId) {
+            connectionState.draft = { ...connectionState.draft, tenantId: matchedTenant };
+        }
         connectionState.organizationsError = data.error || "";
     } catch (error) {
         if (!connectionState) {
             return;
         }
         connectionState.organizations = [];
+        connectionState.organizationTenants = new Map();
         connectionState.organizationsError = error.message || "";
     }
     renderConnections();
 }
 
-// Projects and repositories are both optional, so a failure to list them is not
-// reported: the user can still type one, or leave it empty.
+// Projects and repositories are both optional, so an ordinary failure to list
+// them is not reported: the user can still type one, or leave it empty. When the
+// organization requires step-up sign-in for another Entra directory, surface that
+// explicitly inside the picker without discarding what the user typed.
 async function loadConnectionOptions() {
     const organization = connectionState.draft.organization;
     if (!organization) {
         connectionState.projects = [];
         connectionState.repositories = [];
+        connectionState.tenantAuthRequired = null;
         renderConnections();
         return;
     }
     connectionState.loading = "options";
+    connectionState.tenantAuthRequired = null;
     renderConnections();
     const query = new URLSearchParams({ organization });
     const [projectResult, repositoryResult] = await Promise.allSettled([
@@ -1966,6 +2043,21 @@ async function loadConnectionOptions() {
     if (!connectionState || connectionState.draft.organization !== organization) {
         return;
     }
+    const tenantChallenge = [projectResult, repositoryResult].find(
+        (result) => result.status === "rejected" && result.reason?.code === "azure_devops_tenant_auth_required",
+    )?.reason || null;
+    if (tenantChallenge) {
+        if (tenantChallenge.tenantId) {
+            connectionState.draft = { ...connectionState.draft, tenantId: tenantChallenge.tenantId };
+        }
+        connectionState.tenantAuthRequired = {
+            tenantId: tenantChallenge.tenantId || "",
+            organization,
+            message: tenantChallenge.message || "",
+        };
+    } else {
+        connectionState.tenantAuthRequired = null;
+    }
     connectionState.projects = projectResult.status === "fulfilled"
         ? (projectResult.value.projects || []).map((project) => project.name)
         : [];
@@ -1976,6 +2068,36 @@ async function loadConnectionOptions() {
     renderConnections();
 }
 
+async function authorizeConnectionTenant(target = {}) {
+    if (!connectionState || connectionState.authorizingTenant) {
+        return;
+    }
+    const organization = target.organization || connectionState.draft.organization || "";
+    const tenant = target.tenantId || connectionState.draft.tenantId || "";
+    connectionState.authorizingTenant = true;
+    connectionState.error = "";
+    renderConnections();
+    const succeeded = await startAuth(activeAuthProvider(), {
+        tenant,
+        organization,
+        skipRefresh: true,
+    });
+    if (!connectionState) {
+        return;
+    }
+    connectionState.authorizingTenant = false;
+    if (succeeded) {
+        connectionState.tenantAuthRequired = null;
+        await loadConnectionOrganizations();
+        if (connectionState?.draft.organization) {
+            await loadConnectionOptions();
+        }
+    } else {
+        connectionState.error = "Directory sign-in did not complete. Try again.";
+        renderConnections();
+    }
+}
+
 function openConnectionPanel(connection) {
     const current = connection || currentConfig?.connections?.[0] || null;
     connectionState = {
@@ -1983,14 +2105,18 @@ function openConnectionPanel(connection) {
             organization: current?.organization || "",
             project: current?.project || "",
             repositoryId: current?.repositoryId || "",
+            tenantId: current?.tenantId || "",
             isDefault: Boolean(current?.isDefault),
         },
         organizations: [],
+        organizationTenants: new Map(),
         organizationsError: "",
         projects: [],
         repositories: [],
         loadedOptionsFor: "",
         loading: "",
+        tenantAuthRequired: null,
+        authorizingTenant: false,
         error: "",
         saving: false,
         firstRun: !(currentConfig?.connections || []).length,
@@ -2005,7 +2131,12 @@ function openConnectionPanel(connection) {
         onDraftChange: (patch) => {
             // Typing only updates state and patches the panel: the dependent
             // lists wait for the organization field to settle.
-            connectionState.draft = { ...connectionState.draft, ...patch };
+            const nextPatch = { ...patch };
+            if (Object.hasOwn(patch, "organization") && patch.organization !== connectionState.draft.organization) {
+                nextPatch.tenantId = connectionState.organizationTenants.get((patch.organization || "").toLowerCase()) || "";
+                connectionState.tenantAuthRequired = null;
+            }
+            connectionState.draft = { ...connectionState.draft, ...nextPatch };
             connectionState.error = "";
             renderConnections();
         },
@@ -2014,12 +2145,21 @@ function openConnectionPanel(connection) {
                 return;
             }
             connectionState.loadedOptionsFor = organization;
+            const tenantId = connectionState.organizationTenants.get((organization || "").toLowerCase()) || "";
             // A project or repository from the previous organization is not a
             // valid choice in this one.
-            connectionState.draft = { ...connectionState.draft, organization, project: "", repositoryId: "" };
+            connectionState.draft = {
+                ...connectionState.draft,
+                organization,
+                tenantId,
+                project: "",
+                repositoryId: "",
+            };
+            connectionState.tenantAuthRequired = null;
             renderConnections();
             loadConnectionOptions();
         },
+        onAuthorizeTenant: authorizeConnectionTenant,
         onSave: saveConnection,
         onClearDefault: clearDefaultConnection,
         onCancel: closeConnectionPanel,
@@ -2047,8 +2187,16 @@ async function saveConnection() {
     // Read from the fields rather than the draft, so what the user can see in the
     // form is what gets saved even if an engine did not raise the event the field
     // listens for.
-    const draft = { ...connectionState.draft, ...connectionPanelView.read() };
-    connectionState.draft = draft;
+    const fields = connectionPanelView.read();
+    const matchedTenant = fields.organization
+        ? connectionState.organizationTenants.get(fields.organization.toLowerCase())
+            || (fields.organization === connectionState.draft.organization ? connectionState.draft.tenantId : "")
+        : "";
+    const draft = {
+        ...fields,
+        ...(matchedTenant ? { tenantId: matchedTenant } : {}),
+    };
+    connectionState.draft = { ...connectionState.draft, ...fields, tenantId: matchedTenant || "" };
     connectionState.saving = true;
     connectionState.error = "";
     renderConnections();
@@ -2296,9 +2444,13 @@ connectionPanel.addEventListener("keydown", (event) => {
         closeConnectionPanel();
     }
 });
-signInMicrosoftButton.addEventListener("click", () => startAuth("microsoft"));
+function readSignInSplashOptions() {
+    const tenant = signInTenantInput?.value?.trim() || "";
+    return tenant ? { tenant } : {};
+}
+signInMicrosoftButton.addEventListener("click", () => startAuth("microsoft", readSignInSplashOptions()));
 if (AGENCY_AUTH_ENABLED) {
-    signInAgencyButton.addEventListener("click", () => startAuth("agency"));
+    signInAgencyButton.addEventListener("click", () => startAuth("agency", readSignInSplashOptions()));
 }
 signOutButton.addEventListener("click", signOut);
 // Middle-click closes a tab, matching the browser convention the tabs imitate.
