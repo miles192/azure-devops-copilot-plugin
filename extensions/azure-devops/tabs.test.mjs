@@ -85,6 +85,11 @@ function makeFetch(state) {
             });
             return state.holdConfig ? state.holdConfig.then(() => response) : response;
         }
+        if (path.includes("/api/auth/start") && state.onAuthStart) {
+            const body = options.body ? JSON.parse(options.body) : {};
+            state.authStartRequests = [...(state.authStartRequests || []), body];
+            return json(await state.onAuthStart(body));
+        }
         if (path.includes("/api/auth/status")) {
             state.authStatusRequests = (state.authStatusRequests || 0) + 1;
             const response = json(state.authStatus || {
@@ -120,9 +125,17 @@ function makeFetch(state) {
             return json({ workItem: { id: 900, type: "Bug", title: "Referenced item", relations: state.relations || [] } });
         }
         if (path.includes("/api/organizations")) {
-            return json({ organizations: (state.organizations || []).map((name) => ({ name, id: name })), error: "" });
+            return json({
+                organizations: (state.organizations || []).map((entry) => (
+                    typeof entry === "string" ? { name: entry, id: entry } : entry
+                )),
+                error: "",
+            });
         }
         if (path.includes("/api/projects")) {
+            if (state.projectsError) {
+                return { ok: false, json: async () => state.projectsError };
+            }
             return json({ projects: (state.projects || []).map((name) => ({ name, id: name })) });
         }
         if (path.includes("/api/repositories")) {
@@ -3168,4 +3181,152 @@ test("an action menu opens over its container instead of being clipped by it", d
     at({ top: 100, bottom: 126, left: 780, right: 808, width: 28, height: 26 });
     trigger.click();
     assert.equal(overlay.style.left, "612px", "clamped to the viewport margin");
+});
+
+test("typing a B2B organization requiring directory sign-in keeps the picker open and authorizes its tenant in place", describeDom, async () => {
+    const b2bTenant = "22222222-2222-2222-2222-222222222222";
+    const state = {
+        remote: { isAzureDevOps: false },
+        connections: [],
+        configAuth: { isAuthenticated: true, authType: "microsoft", azureAuthDiscovery: { selected: "" } },
+        organizations: [],
+        projectsError: {
+            error: "azure_devops_tenant_auth_required",
+            tenantId: b2bTenant,
+            organization: "fabrikam",
+            message: 'Additional directory sign-in is required to access Azure DevOps organization "fabrikam".',
+        },
+        onAuthStart: async () => {
+            state.projectsError = null;
+            state.projects = ["Widgets"];
+            return {
+                authProcess: {
+                    provider: "microsoft",
+                    status: "succeeded",
+                    output: "Signed in to Azure DevOps with Microsoft.",
+                },
+            };
+        },
+    };
+    const { window } = await boot(state);
+    await settle();
+
+    const inputs = panel(window).querySelectorAll(".connection-input");
+    const orgInput = inputs[0];
+    orgInput.value = "fabrikam";
+    orgInput.dispatchEvent(new window.Event("change"));
+    await settle();
+
+    assert.equal(window.document.getElementById("signInSplash").hidden, true, "never collapses back to the sign-in splash");
+    assert.equal(panel(window).hidden, false, "the connection picker stays open");
+    assert.equal(orgInput.value, "fabrikam", "the typed organization name is preserved");
+
+    const prompt = panel(window).querySelector(".connection-auth-prompt");
+    assert.equal(prompt.hidden, false);
+    const authorizeButton = prompt.querySelector("button");
+    assert.equal(authorizeButton.textContent, "Sign in to directory");
+
+    authorizeButton.click();
+    await settle();
+
+    assert.deepEqual(state.authStartRequests, [{
+        provider: "microsoft",
+        tenant: b2bTenant,
+        organization: "fabrikam",
+    }]);
+    assert.equal(prompt.hidden, true, "the prompt clears once directory sign-in succeeds");
+
+    const projectInput = inputs[1];
+    projectInput.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    const projectOptions = [...panel(window).querySelectorAll('#connectionProjects [role="option"]')].map((el) => el.textContent);
+    assert.deepEqual(projectOptions, ["Widgets"]);
+});
+
+test("Home renders per-connection directory sign-in prompts without blanking working connections", describeDom, async () => {
+    const secondTenant = "33333333-3333-3333-3333-333333333333";
+    const state = {
+        configAuth: { isAuthenticated: true, authType: "microsoft", azureAuthDiscovery: { selected: "" } },
+        homeConnections: [
+            {
+                source: "remote",
+                organization: "contoso",
+                project: "Widgets",
+                repositoryId: "widgets-repo",
+                isRemote: true,
+                isDefault: false,
+                prs: [101],
+            },
+            {
+                source: "default",
+                organization: "northwind",
+                project: "Logistics",
+                repositoryId: "",
+                isRemote: false,
+                isDefault: true,
+                authRequired: {
+                    organization: "northwind",
+                    tenantId: secondTenant,
+                    message: 'Additional directory sign-in is required to access "northwind".',
+                },
+            },
+        ],
+        onAuthStart: async () => {
+            state.homeConnections[1] = {
+                ...state.homeConnections[1],
+                authRequired: undefined,
+                workItems: [501],
+            };
+            return {
+                authProcess: {
+                    provider: "microsoft",
+                    status: "succeeded",
+                    output: "Signed in to Azure DevOps with Microsoft.",
+                },
+            };
+        },
+    };
+    const { window } = await boot(state);
+    await settle();
+
+    assert.match(window.document.getElementById("homeContent").textContent, /PR 101/, "the primary connection still renders its pull requests");
+    assert.match(window.document.getElementById("homeContent").textContent, /Directory sign-in required/);
+
+    const authorizeButton = [...window.document.querySelectorAll("#homeContent button")]
+        .find((button) => button.textContent === "Sign in to directory");
+    assert.ok(authorizeButton);
+    authorizeButton.click();
+    await settle();
+
+    assert.deepEqual(state.authStartRequests, [{
+        provider: "microsoft",
+        tenant: secondTenant,
+        organization: "northwind",
+    }]);
+    assert.match(window.document.getElementById("homeContent").textContent, /WI 501/, "refresh after step-up auth loads the second connection");
+});
+
+test("the sign-in splash forwards an optional directory tenant or organization hint", describeDom, async () => {
+    const state = {
+        configAuth: { isAuthenticated: false, authType: "none", azureAuthDiscovery: { selected: "" } },
+        onAuthStart: async () => ({
+            authProcess: {
+                provider: "microsoft",
+                status: "succeeded",
+                output: "Signed in.",
+            },
+        }),
+    };
+    const { window } = await boot(state);
+    await settle();
+
+    assert.equal(window.document.getElementById("signInSplash").hidden, false);
+    const tenantInput = window.document.getElementById("signInTenantInput");
+    tenantInput.value = "fabrikam.onmicrosoft.com";
+    window.document.getElementById("signInMicrosoftButton").click();
+    await settle();
+
+    assert.deepEqual(state.authStartRequests, [{
+        provider: "microsoft",
+        tenant: "fabrikam.onmicrosoft.com",
+    }]);
 });

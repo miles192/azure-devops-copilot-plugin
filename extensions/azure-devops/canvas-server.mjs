@@ -28,7 +28,9 @@ import {
     clearConnectionDefault,
     clearConnectionPreference,
     normalizeConnection,
+    normalizeTenantGuid,
     readConnectionPreference,
+    rememberConnectionTenant,
     resolveConnections,
     selectConnection,
     writeConnectionPreference,
@@ -91,9 +93,15 @@ const AZUREAUTH_TIMEOUT_MINUTES = "15";
 const AZUREAUTH_SILENT_TIMEOUT_MINUTES = "1";
 const AZUREAUTH_SILENT_TIMEOUT_MS = 10 * 1000;
 const AZURE_DEVOPS_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798";
-const AZURE_AUTHORITY = "https://login.microsoftonline.com/common/oauth2/v2.0";
+const AZURE_AUTHORITY_ORIGIN = "https://login.microsoftonline.com";
+const AZURE_DEFAULT_TENANT = "common";
+const AZURE_SPECIAL_TENANTS = new Set(["common", "organizations", "consumers"]);
+const TENANT_DOMAIN_PATTERN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+const DEFAULT_TOKEN_BUCKET = "default";
 const AZURE_PUBLIC_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const AZURE_DEVOPS_SCOPE = `${AZURE_DEVOPS_RESOURCE_ID}/.default offline_access openid profile`;
+const AZURE_MANAGEMENT_SCOPE = "https://management.core.windows.net/.default offline_access";
+const AZURE_MANAGEMENT_TENANTS_URL = "https://management.azure.com/tenants?api-version=2022-12-01";
 const AZURE_OAUTH_LOOPBACK_HOST = "localhost";
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const PROJECT_EXTENSION_REPO_ROOT = resolve(EXTENSION_DIR, "..", "..");
@@ -111,8 +119,12 @@ const pullRequestCommentCountCache = new Map();
 const pullRequestCommentCountQueue = [];
 let activeWorkItemTypeIconRequests = 0;
 let activePullRequestCommentCountRequests = 0;
-let azureAuthTokenCache = null;
-let browserTokenCache = null;
+const azureAuthTokensByTenant = new Map();
+const inFlightAzureAuthByTenant = new Map();
+const browserTokensByTenant = new Map();
+const inFlightBrowserRefreshes = new Map();
+const organizationTenantCache = new Map();
+let browserPrimarySession = null;
 let silentAgencyAuthAttempt = null;
 // Bumped on sign-out so a sign-in still in flight cannot write its result
 // afterwards. Sign-in work outlives the request that started it.
@@ -361,8 +373,38 @@ function createPkcePair() {
     };
 }
 
-async function readAzureAuthTokenCache() {
-    return azureAuthTokenCache;
+function normalizeTenantIdentifier(value) {
+    const candidate = normalizeString(value).toLowerCase();
+    if (!candidate) {
+        return "";
+    }
+    if (AZURE_SPECIAL_TENANTS.has(candidate)) {
+        return candidate;
+    }
+    const guid = normalizeTenantGuid(candidate);
+    if (guid) {
+        return guid;
+    }
+    if (TENANT_DOMAIN_PATTERN.test(candidate)) {
+        return candidate;
+    }
+    return "";
+}
+
+function isSpecificTenantIdentifier(value) {
+    const normalized = normalizeTenantIdentifier(value);
+    return Boolean(normalized && !AZURE_SPECIAL_TENANTS.has(normalized));
+}
+
+function microsoftAuthorityUrl(tenant = AZURE_DEFAULT_TENANT) {
+    const normalized = normalizeTenantIdentifier(tenant || AZURE_DEFAULT_TENANT);
+    if (!normalized) {
+        throw new CanvasError(
+            "azure_devops_invalid_tenant",
+            "Directory tenant must be a valid Entra tenant ID or domain name.",
+        );
+    }
+    return `${AZURE_AUTHORITY_ORIGIN}/${encodeURIComponent(normalized)}/oauth2/v2.0`;
 }
 
 function parseJwtPayload(accessToken) {
@@ -384,50 +426,119 @@ function parseJwtExpiry(accessToken) {
     return Number.isFinite(exp) && exp > 0 ? exp * 1000 : null;
 }
 
-async function writeAzureAuthTokenCache(tokenResult) {
+function resolveTokenBucketKey(accessToken, requestedTenant = "") {
+    const claimTenant = normalizeTenantGuid(parseJwtPayload(accessToken)?.tid);
+    if (claimTenant) {
+        return claimTenant;
+    }
+    const normalizedRequested = normalizeTenantIdentifier(requestedTenant);
+    if (normalizedRequested && !AZURE_SPECIAL_TENANTS.has(normalizedRequested)) {
+        return normalizedRequested;
+    }
+    return DEFAULT_TOKEN_BUCKET;
+}
+
+async function readAzureAuthTokenCache(tenantId = "") {
+    const target = normalizeTenantIdentifier(tenantId);
+    if (target && !AZURE_SPECIAL_TENANTS.has(target)) {
+        const match = azureAuthTokensByTenant.get(target);
+        if (match) {
+            return match;
+        }
+        const fallback = azureAuthTokensByTenant.get(DEFAULT_TOKEN_BUCKET);
+        if (fallback && !parseJwtPayload(fallback.accessToken)) {
+            return fallback;
+        }
+        return null;
+    }
+    for (const entry of azureAuthTokensByTenant.values()) {
+        if (entry?.accessToken && (!entry.expiresAt || Number(entry.expiresAt) > Date.now())) {
+            return entry;
+        }
+    }
+    return azureAuthTokensByTenant.values().next().value || null;
+}
+
+async function writeAzureAuthTokenCache(tokenResult, { requestedTenant = "" } = {}) {
     const accessToken = normalizeString(tokenResult.accessToken ?? tokenResult.access_token);
+    if (!accessToken) {
+        throw new CanvasError("azure_devops_azureauth_token_empty", "AzureAuth returned an empty Azure DevOps token.");
+    }
+    const tenantKey = resolveTokenBucketKey(accessToken, requestedTenant || tokenResult.tenantId);
+    const claimTenant = normalizeTenantGuid(parseJwtPayload(accessToken)?.tid);
     const cache = {
         accessToken,
         expiresAt: parseJwtExpiry(accessToken),
+        tenantKey,
+        tenantId: claimTenant || normalizeTenantGuid(requestedTenant || tokenResult.tenantId),
         source: normalizeString(tokenResult.source) || "azureauth",
         updatedAt: new Date().toISOString(),
     };
-    if (!cache.accessToken) {
-        throw new CanvasError("azure_devops_azureauth_token_empty", "AzureAuth returned an empty Azure DevOps token.");
-    }
-    azureAuthTokenCache = cache;
+    azureAuthTokensByTenant.set(tenantKey, cache);
     return cache;
 }
 
 async function clearAzureAuthTokenCache() {
-    const hadTokenCache = Boolean(azureAuthTokenCache);
-    azureAuthTokenCache = null;
+    const hadTokenCache = azureAuthTokensByTenant.size > 0;
+    azureAuthTokensByTenant.clear();
+    inFlightAzureAuthByTenant.clear();
     return hadTokenCache;
 }
 
-async function writeBrowserTokenCache(tokenResult) {
+async function writeBrowserTokenCache(tokenResult, { requestedTenant = "" } = {}) {
+    const accessToken = normalizeString(tokenResult.access_token ?? tokenResult.accessToken);
+    if (!accessToken) {
+        throw new CanvasError("azure_devops_oauth_token_empty", "Microsoft identity platform returned an empty access token.");
+    }
+    const claims = parseJwtPayload(accessToken) || {};
+    const tenantKey = resolveTokenBucketKey(accessToken, requestedTenant || tokenResult.tenantId);
+    const claimTenant = normalizeTenantGuid(claims.tid);
+    const refreshToken = normalizeString(tokenResult.refresh_token ?? tokenResult.refreshToken);
+    const existing = browserTokensByTenant.get(tenantKey);
+    const loginHint = normalizeString(claims.preferred_username || claims.upn || claims.email)
+        || existing?.loginHint
+        || browserPrimarySession?.loginHint
+        || "";
+    const expiresIn = Number(tokenResult.expires_in || 0);
+    const expiresAt = expiresIn > 0
+        ? Date.now() + Math.max(0, expiresIn - 60) * 1000
+        : (parseJwtExpiry(accessToken) || Date.now() + Math.max(0, expiresIn - 60) * 1000);
+    const effectiveRefreshToken = refreshToken || existing?.refreshToken || browserPrimarySession?.refreshToken || "";
     const cache = {
-        accessToken: normalizeString(tokenResult.access_token),
-        refreshToken: normalizeString(tokenResult.refresh_token),
-        expiresAt: Date.now() + Math.max(0, Number(tokenResult.expires_in || 0) - 60) * 1000,
+        accessToken,
+        refreshToken: effectiveRefreshToken,
+        expiresAt,
+        tenantKey,
+        tenantId: claimTenant || normalizeTenantGuid(requestedTenant || tokenResult.tenantId),
+        loginHint,
         source: "browser-oauth",
         updatedAt: new Date().toISOString(),
     };
-    if (!cache.accessToken) {
-        throw new CanvasError("azure_devops_oauth_token_empty", "Microsoft identity platform returned an empty access token.");
-    }
-    browserTokenCache = cache;
+    browserTokensByTenant.set(tenantKey, cache);
+    browserPrimarySession = {
+        refreshToken: refreshToken || browserPrimarySession?.refreshToken || effectiveRefreshToken,
+        homeTenantKey: browserPrimarySession?.homeTenantKey || tenantKey,
+        loginHint,
+        updatedAt: cache.updatedAt,
+    };
     return cache;
 }
 
 async function clearBrowserTokenCache() {
-    const hadTokenCache = Boolean(browserTokenCache);
-    browserTokenCache = null;
+    const hadTokenCache = browserTokensByTenant.size > 0 || Boolean(browserPrimarySession);
+    browserTokensByTenant.clear();
+    inFlightBrowserRefreshes.clear();
+    browserPrimarySession = null;
     return hadTokenCache;
 }
 
-function azureAuthTokenArgs(timeoutMinutes = AZUREAUTH_TIMEOUT_MINUTES) {
-    return ["ado", "token", "--output", "token", "--timeout", timeoutMinutes, "--prompt-hint", "azure-devops-canvas"];
+function azureAuthTokenArgs(timeoutMinutes = AZUREAUTH_TIMEOUT_MINUTES, tenant = "") {
+    const args = ["ado", "token", "--output", "token", "--timeout", timeoutMinutes, "--prompt-hint", "azure-devops-canvas"];
+    const normalizedTenant = normalizeTenantIdentifier(tenant);
+    if (normalizedTenant && !AZURE_SPECIAL_TENANTS.has(normalizedTenant)) {
+        args.push("--domain", normalizedTenant);
+    }
+    return args;
 }
 
 function managedAzureAuthDiscovery() {
@@ -519,9 +630,9 @@ function azureAuthExecutable(discovery = managedAzureAuthDiscovery()) {
 async function acquireAzureAuthToken(
     executable = azureAuthExecutable(),
     timeoutMs = (Number(AZUREAUTH_TIMEOUT_MINUTES) + 1) * 60 * 1000,
-    { timeoutMinutes = AZUREAUTH_TIMEOUT_MINUTES } = {},
+    { timeoutMinutes = AZUREAUTH_TIMEOUT_MINUTES, tenant = "" } = {},
 ) {
-    const args = azureAuthTokenArgs(timeoutMinutes);
+    const args = azureAuthTokenArgs(timeoutMinutes, tenant);
     try {
         const { stdout } = await execFileAsync(executable, args, {
             timeout: timeoutMs,
@@ -542,14 +653,91 @@ async function acquireAzureAuthToken(
     }
 }
 
-async function getAzureAuthAccessToken() {
-    const cache = await readAzureAuthTokenCache();
+function tenantAuthRequiredError({ tenantId = "", organization = "", message = "" } = {}) {
+    const normalizedTenant = normalizeTenantIdentifier(tenantId);
+    const normalizedOrg = normalizeString(organization);
+    const error = new CanvasError(
+        "azure_devops_tenant_auth_required",
+        message || (normalizedOrg
+            ? `Additional directory sign-in is required to access Azure DevOps organization "${normalizedOrg}".`
+            : "Additional directory sign-in is required for this Azure DevOps directory."),
+    );
+    if (normalizedTenant && !AZURE_SPECIAL_TENANTS.has(normalizedTenant)) {
+        error.tenantId = normalizedTenant;
+    }
+    if (normalizedOrg) {
+        error.organization = normalizedOrg;
+    }
+    return error;
+}
+
+function isOAuthInteractionRequired(data = {}, errorMessage = "") {
+    const code = normalizeString(data.error).toLowerCase();
+    if (["interaction_required", "login_required", "consent_required", "invalid_grant"].includes(code)) {
+        return true;
+    }
+    const text = `${normalizeString(data.error_description)} ${normalizeString(errorMessage)}`;
+    return /\bAADSTS(?:50076|50079|50020|53003|65001|70008|70043)\b/i.test(text);
+}
+
+async function getAzureAuthAccessToken({ tenantId = "", organization = "", requireTenantMatch = false } = {}) {
+    const targetTenant = normalizeTenantIdentifier(tenantId);
+    const cache = await readAzureAuthTokenCache(targetTenant);
     if (cache?.accessToken && (!cache.expiresAt || Number(cache.expiresAt) > Date.now())) {
-        return {
-            accessToken: cache.accessToken,
-            source: cache.source || "azureauth",
-            expiresAt: cache.expiresAt,
-        };
+        const claimTenant = normalizeTenantGuid(parseJwtPayload(cache.accessToken)?.tid);
+        if (!requireTenantMatch || !normalizeTenantGuid(targetTenant) || !claimTenant || claimTenant === normalizeTenantGuid(targetTenant)) {
+            return {
+                accessToken: cache.accessToken,
+                source: cache.source || "azureauth",
+                expiresAt: cache.expiresAt,
+                tenantKey: cache.tenantKey || DEFAULT_TOKEN_BUCKET,
+                tenantId: cache.tenantId || claimTenant || "",
+            };
+        }
+    }
+    if (isSpecificTenantIdentifier(targetTenant) && azureAuthTokensByTenant.size > 0) {
+        const discovery = managedAzureAuthDiscovery();
+        if (discovery.selected) {
+            let pending = inFlightAzureAuthByTenant.get(targetTenant);
+            if (!pending) {
+                pending = (async () => {
+                    const accessToken = await acquireAzureAuthToken(discovery.selected, AZUREAUTH_SILENT_TIMEOUT_MS, {
+                        timeoutMinutes: AZUREAUTH_SILENT_TIMEOUT_MINUTES,
+                        tenant: targetTenant,
+                    });
+                    const claimTenant = normalizeTenantGuid(parseJwtPayload(accessToken)?.tid);
+                    if (requireTenantMatch && normalizeTenantGuid(targetTenant) && claimTenant && claimTenant !== normalizeTenantGuid(targetTenant)) {
+                        throw Object.assign(
+                            new CanvasError(
+                                "azure_devops_tenant_token_mismatch",
+                                "AzureAuth did not return a token for the requested Azure DevOps directory.",
+                            ),
+                            { tenantId: targetTenant, organization: normalizeString(organization) },
+                        );
+                    }
+                    return writeAzureAuthTokenCache({ accessToken, source: "azureauth", tenantId: targetTenant }, { requestedTenant: targetTenant });
+                })().finally(() => {
+                    inFlightAzureAuthByTenant.delete(targetTenant);
+                });
+                inFlightAzureAuthByTenant.set(targetTenant, pending);
+            }
+            try {
+                const acquired = await pending;
+                return {
+                    accessToken: acquired.accessToken,
+                    source: acquired.source || "azureauth",
+                    expiresAt: acquired.expiresAt,
+                    tenantKey: acquired.tenantKey,
+                    tenantId: acquired.tenantId,
+                };
+            } catch (error) {
+                if (error?.code === "azure_devops_tenant_token_mismatch") {
+                    throw error;
+                }
+                throw tenantAuthRequiredError({ tenantId: targetTenant, organization });
+            }
+        }
+        throw tenantAuthRequiredError({ tenantId: targetTenant, organization });
     }
     throw new CanvasError("azure_devops_authentication_required", "Select an Azure DevOps sign-in option.");
 }
@@ -602,9 +790,10 @@ function startSilentAgencyAuth(entry) {
     if (!AGENCY_AUTH_ENABLED) {
         return null;
     }
-    const cache = azureAuthTokenCache;
-    if (cache?.accessToken && (!cache.expiresAt || Number(cache.expiresAt) > Date.now())) {
-        return null;
+    for (const cache of azureAuthTokensByTenant.values()) {
+        if (cache?.accessToken && (!cache.expiresAt || Number(cache.expiresAt) > Date.now())) {
+            return null;
+        }
     }
     if (!hasAgencyAuthMarker()) {
         return null;
@@ -662,13 +851,14 @@ function startSilentAgencyAuth(entry) {
     return authProcess;
 }
 
-async function requestMicrosoftToken(params) {
+async function requestMicrosoftToken(params, { tenant = AZURE_DEFAULT_TENANT, scope = AZURE_DEVOPS_SCOPE } = {}) {
+    const authority = microsoftAuthorityUrl(tenant);
     const body = new URLSearchParams({
         client_id: AZURE_PUBLIC_CLIENT_ID,
-        scope: AZURE_DEVOPS_SCOPE,
+        scope,
         ...params,
     });
-    const response = await fetch(`${AZURE_AUTHORITY}/token`, {
+    const response = await fetch(`${authority}/token`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body,
@@ -683,41 +873,188 @@ async function requestMicrosoftToken(params) {
         }
     }
     if (!response.ok) {
-        throw new CanvasError(
-            "azure_devops_oauth_token_failed",
-            data.error_description || data.error || response.statusText || "Microsoft token request failed.",
-        );
+        const message = data.error_description || data.error || response.statusText || "Microsoft token request failed.";
+        const failure = new CanvasError("azure_devops_oauth_token_failed", message);
+        failure.oauthError = normalizeString(data.error).toLowerCase();
+        failure.interactionRequired = isOAuthInteractionRequired(data, message);
+        throw failure;
     }
     return data;
 }
 
-async function getBrowserOAuthAccessToken() {
-    const cache = browserTokenCache;
-    if (!cache) {
+function hasOtherBrowserTenantCredential(excludedTenantKey = "") {
+    for (const [key, entry] of browserTokensByTenant.entries()) {
+        if (key === excludedTenantKey) {
+            continue;
+        }
+        if ((entry?.accessToken && Number(entry.expiresAt || 0) > Date.now()) || entry?.refreshToken) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function findAnyRefreshToken() {
+    if (browserPrimarySession?.refreshToken) {
+        return browserPrimarySession.refreshToken;
+    }
+    for (const entry of browserTokensByTenant.values()) {
+        if (entry?.refreshToken) {
+            return entry.refreshToken;
+        }
+    }
+    return "";
+}
+
+function selectDefaultBrowserTokenEntry() {
+    const now = Date.now();
+    const homeKey = browserPrimarySession?.homeTenantKey;
+    if (homeKey) {
+        const homeEntry = browserTokensByTenant.get(homeKey);
+        if (homeEntry?.accessToken && Number(homeEntry.expiresAt || 0) > now) {
+            return homeEntry;
+        }
+    }
+    for (const entry of browserTokensByTenant.values()) {
+        if (entry?.accessToken && Number(entry.expiresAt || 0) > now) {
+            return entry;
+        }
+    }
+    if (homeKey && browserTokensByTenant.has(homeKey)) {
+        return browserTokensByTenant.get(homeKey);
+    }
+    return browserTokensByTenant.values().next().value || null;
+}
+
+async function refreshBrowserTokenForTenant(targetTenant, refreshToken, { organization = "", requireTenantMatch = false } = {}) {
+    const key = normalizeTenantIdentifier(targetTenant || AZURE_DEFAULT_TENANT) || AZURE_DEFAULT_TENANT;
+    let pending = inFlightBrowserRefreshes.get(key);
+    if (!pending) {
+        pending = (async () => {
+            const refreshed = await requestMicrosoftToken(
+                {
+                    grant_type: "refresh_token",
+                    refresh_token: refreshToken,
+                },
+                { tenant: key },
+            );
+            const expectedGuid = normalizeTenantGuid(key);
+            const returnedGuid = normalizeTenantGuid(parseJwtPayload(refreshed.access_token)?.tid);
+            if (requireTenantMatch && expectedGuid && returnedGuid && returnedGuid !== expectedGuid) {
+                throw Object.assign(
+                    new CanvasError(
+                        "azure_devops_tenant_token_mismatch",
+                        "Microsoft identity platform did not return a token for the requested Azure DevOps directory.",
+                    ),
+                    { tenantId: expectedGuid, organization: normalizeString(organization), returnedTenantId: returnedGuid },
+                );
+            }
+            return writeBrowserTokenCache(
+                {
+                    ...refreshed,
+                    refresh_token: refreshed.refresh_token || refreshToken,
+                },
+                { requestedTenant: key },
+            );
+        })().finally(() => {
+            inFlightBrowserRefreshes.delete(key);
+        });
+        inFlightBrowserRefreshes.set(key, pending);
+    }
+    return pending;
+}
+
+async function getBrowserOAuthAccessToken({ tenantId = "", organization = "", requireTenantMatch = false } = {}) {
+    if (browserTokensByTenant.size === 0 && !browserPrimarySession?.refreshToken) {
         throw new CanvasError("azure_devops_oauth_login_required", "Select an Azure DevOps sign-in option.");
     }
-    if (cache.accessToken && Number(cache.expiresAt || 0) > Date.now()) {
+
+    const targetTenant = normalizeTenantIdentifier(tenantId);
+    if (isSpecificTenantIdentifier(targetTenant)) {
+        const direct = browserTokensByTenant.get(targetTenant);
+        if (direct?.accessToken && Number(direct.expiresAt || 0) > Date.now()) {
+            return {
+                accessToken: direct.accessToken,
+                source: direct.source,
+                expiresAt: direct.expiresAt,
+                tenantKey: direct.tenantKey,
+                tenantId: direct.tenantId,
+            };
+        }
+        // Synthetic non-JWT tokens used in unit tests sit in the default bucket
+        // without a tid claim; allow them when no strict cross-tenant match is asked.
+        const opaqueDefault = browserTokensByTenant.get(DEFAULT_TOKEN_BUCKET);
+        if (
+            !requireTenantMatch &&
+            opaqueDefault?.accessToken &&
+            !parseJwtPayload(opaqueDefault.accessToken) &&
+            Number(opaqueDefault.expiresAt || 0) > Date.now()
+        ) {
+            return {
+                accessToken: opaqueDefault.accessToken,
+                source: opaqueDefault.source,
+                expiresAt: opaqueDefault.expiresAt,
+                tenantKey: opaqueDefault.tenantKey,
+                tenantId: "",
+            };
+        }
+
+        const refreshToken = direct?.refreshToken || findAnyRefreshToken();
+        if (!refreshToken) {
+            if (requireTenantMatch || hasOtherBrowserTenantCredential(targetTenant)) {
+                throw tenantAuthRequiredError({ tenantId: targetTenant, organization });
+            }
+            throw new CanvasError("azure_devops_oauth_login_required", "Microsoft sign-in expired. Sign in again.");
+        }
+
+        try {
+            const refreshedCache = await refreshBrowserTokenForTenant(targetTenant, refreshToken, {
+                organization,
+                requireTenantMatch,
+            });
+            return {
+                accessToken: refreshedCache.accessToken,
+                source: refreshedCache.source,
+                expiresAt: refreshedCache.expiresAt,
+                tenantKey: refreshedCache.tenantKey,
+                tenantId: refreshedCache.tenantId,
+            };
+        } catch (error) {
+            if (error?.code === "azure_devops_tenant_token_mismatch") {
+                throw error;
+            }
+            if (direct && Number(direct.expiresAt || 0) <= Date.now()) {
+                browserTokensByTenant.delete(targetTenant);
+            }
+            if (error?.interactionRequired || requireTenantMatch || hasOtherBrowserTenantCredential(targetTenant)) {
+                throw tenantAuthRequiredError({ tenantId: targetTenant, organization });
+            }
+            throw error;
+        }
+    }
+
+    const cache = selectDefaultBrowserTokenEntry();
+    if (cache?.accessToken && Number(cache.expiresAt || 0) > Date.now()) {
         return {
             accessToken: cache.accessToken,
             source: cache.source,
             expiresAt: cache.expiresAt,
+            tenantKey: cache.tenantKey,
+            tenantId: cache.tenantId,
         };
     }
-    if (!cache.refreshToken) {
+    const refreshToken = cache?.refreshToken || findAnyRefreshToken();
+    if (!refreshToken) {
         throw new CanvasError("azure_devops_oauth_login_required", "Microsoft sign-in expired. Sign in again.");
     }
-    const refreshed = await requestMicrosoftToken({
-        grant_type: "refresh_token",
-        refresh_token: cache.refreshToken,
-    });
-    const refreshedCache = await writeBrowserTokenCache({
-        ...refreshed,
-        refresh_token: refreshed.refresh_token || cache.refreshToken,
-    });
+    const refreshTenant = cache?.tenantId || AZURE_DEFAULT_TENANT;
+    const refreshedCache = await refreshBrowserTokenForTenant(refreshTenant, refreshToken);
     return {
         accessToken: refreshedCache.accessToken,
         source: refreshedCache.source,
         expiresAt: refreshedCache.expiresAt,
+        tenantKey: refreshedCache.tenantKey,
+        tenantId: refreshedCache.tenantId,
     };
 }
 
@@ -728,6 +1065,19 @@ function openBrowser(url) {
     child.unref();
 }
 
+function listAuthenticatedTenants(map) {
+    const now = Date.now();
+    const tenants = [];
+    for (const entry of map.values()) {
+        const valid = Boolean(entry?.accessToken && (!entry.expiresAt || Number(entry.expiresAt) > now));
+        const refreshable = Boolean(entry?.refreshToken);
+        if ((valid || refreshable) && entry.tenantId) {
+            tenants.push(entry.tenantId);
+        }
+    }
+    return [...new Set(tenants)];
+}
+
 async function getAuthState() {
     try {
         const token = await getBrowserOAuthAccessToken();
@@ -736,6 +1086,7 @@ async function getAuthState() {
             authType: "microsoft",
             source: token.source,
             expiresAt: token.expiresAt,
+            authenticatedTenants: listAuthenticatedTenants(browserTokensByTenant),
             azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
         };
     } catch {
@@ -746,6 +1097,7 @@ async function getAuthState() {
             isAuthenticated: false,
             authType: "none",
             source: "",
+            authenticatedTenants: [],
             azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
         };
     }
@@ -756,6 +1108,7 @@ async function getAuthState() {
             authType: "azureauth",
             source: cache.source || "azureauth",
             expiresAt: cache.expiresAt,
+            authenticatedTenants: listAuthenticatedTenants(azureAuthTokensByTenant),
             azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
         };
     }
@@ -763,15 +1116,179 @@ async function getAuthState() {
         isAuthenticated: false,
         authType: "none",
         source: "",
+        authenticatedTenants: [],
         azureAuthDiscovery: effectiveAgencyAuthDiscovery(),
     };
 }
 
-async function startMicrosoftAuth(entry) {
+function extractResourceTenant(response) {
+    const direct = normalizeTenantGuid(response?.headers?.get?.("x-vss-resourcetenant"));
+    if (direct) {
+        return direct;
+    }
+    const wwwAuth = normalizeString(response?.headers?.get?.("www-authenticate"));
+    const match = wwwAuth.match(/authorization_uri\s*=\s*"?([^",\s]+)"?/i);
+    if (!match?.[1]) {
+        return "";
+    }
+    try {
+        const parsed = new URL(match[1]);
+        if (parsed.protocol !== "https:" || parsed.hostname.toLowerCase() !== "login.microsoftonline.com") {
+            return "";
+        }
+        const [segment] = parsed.pathname.split("/").filter(Boolean);
+        return normalizeTenantGuid(decodeURIComponent(segment || ""));
+    } catch {
+        return "";
+    }
+}
+
+function rememberOrganizationTenant(organization, tenantId) {
+    const normalizedTenant = normalizeTenantGuid(tenantId);
+    if (!normalizedTenant || !normalizeString(organization)) {
+        return;
+    }
+    try {
+        const { org } = parseOrganization(organization);
+        const key = org.toLowerCase();
+        organizationTenantCache.set(key, normalizedTenant);
+        rememberConnectionTenant(org, normalizedTenant);
+    } catch {
+        // Ignore malformed organization inputs when recording cache hints.
+    }
+}
+
+function lookupOrganizationTenant(organization) {
+    if (!normalizeString(organization)) {
+        return "";
+    }
+    try {
+        const { org } = parseOrganization(organization);
+        const key = org.toLowerCase();
+        const cached = organizationTenantCache.get(key);
+        if (cached) {
+            return cached;
+        }
+        const record = readConnectionPreference();
+        for (const candidate of [record.lastUsed, record.default]) {
+            if (candidate && candidate.organization.toLowerCase() === key && candidate.tenantId) {
+                organizationTenantCache.set(key, candidate.tenantId);
+                return candidate.tenantId;
+            }
+        }
+    } catch {
+        return "";
+    }
+    return "";
+}
+
+async function probeOrganizationTenant(organization) {
+    const existing = lookupOrganizationTenant(organization);
+    if (existing) {
+        return existing;
+    }
+    let baseUrl;
+    try {
+        ({ baseUrl } = parseOrganization(organization));
+    } catch {
+        return "";
+    }
+    try {
+        const response = await fetch(`${baseUrl}/_apis/connectionData`, {
+            method: "GET",
+            headers: {
+                Accept: "application/json",
+                "X-TFS-FedAuthRedirect": "Suppress",
+            },
+            redirect: "manual",
+        });
+        const tenantId = extractResourceTenant(response);
+        void response.body?.cancel?.()?.catch?.(() => {});
+        if (tenantId) {
+            rememberOrganizationTenant(organization, tenantId);
+            return tenantId;
+        }
+    } catch {
+        // Probing is a best-effort hint before interactive sign-in.
+    }
+    return "";
+}
+
+function resolveInputReferenceOrganization(input = {}) {
+    const direct = normalizeString(input?.organization || input?.org);
+    if (direct) {
+        return direct;
+    }
+    if (hasWorkItemReference(input)) {
+        const reference = resolveWorkItemReference(input);
+        if (reference?.organization) {
+            return reference.organization;
+        }
+    }
+    const pullRequestUrl = normalizeString(input?.pullRequestUrl);
+    if (pullRequestUrl) {
+        const reference = parsePullRequestUrl(pullRequestUrl);
+        if (reference?.organization) {
+            return reference.organization;
+        }
+    }
+    return "";
+}
+
+async function resolveSignInAuthorityTenant(entry, options = {}) {
+    const rawTenant = normalizeString(options.tenant);
+    if (rawTenant) {
+        const directTenant = normalizeTenantIdentifier(rawTenant);
+        if (directTenant) {
+            return directTenant;
+        }
+        // Allow users to enter an Azure DevOps organization name or URL in the
+        // optional directory/organization sign-in field and resolve its tenant.
+        const probedFromHint = await probeOrganizationTenant(rawTenant);
+        if (probedFromHint) {
+            return probedFromHint;
+        }
+        throw new CanvasError(
+            "azure_devops_invalid_tenant",
+            "Enter a valid Entra tenant ID, domain name (such as contoso.onmicrosoft.com), or Azure DevOps organization.",
+        );
+    }
+
+    const explicitOrganization = normalizeString(options.organization);
+    if (explicitOrganization) {
+        const probedExplicit = await probeOrganizationTenant(explicitOrganization);
+        if (probedExplicit) {
+            return probedExplicit;
+        }
+    }
+
+    const inputOrganization = resolveInputReferenceOrganization(entry?.input);
+    if (inputOrganization) {
+        const probedInput = await probeOrganizationTenant(inputOrganization);
+        if (probedInput) {
+            return probedInput;
+        }
+    }
+
+    const effective = await getEffectiveConfig(entry?.input);
+    if (effective.organization) {
+        const probedEffective = await probeOrganizationTenant(effective.organization);
+        if (probedEffective) {
+            return probedEffective;
+        }
+    }
+
+    return AZURE_DEFAULT_TENANT;
+}
+
+async function startMicrosoftAuth(entry, options = {}) {
     if (entry.authProcess?.status === "running") {
         return entry.authProcess;
     }
 
+    const targetTenant = await resolveSignInAuthorityTenant(entry, options);
+    const authority = microsoftAuthorityUrl(targetTenant);
+    const targetOrganization = normalizeString(options.organization);
     const pkce = createPkcePair();
     const generation = authGeneration;
     const state = base64Url(randomBytes(24));
@@ -789,6 +1306,7 @@ async function startMicrosoftAuth(entry) {
         startedAt: new Date().toISOString(),
         completedAt: "",
         redirectUri,
+        ...(isSpecificTenantIdentifier(targetTenant) ? { tenantId: targetTenant } : {}),
     };
     entry.authProcess = authProcess;
 
@@ -824,12 +1342,15 @@ async function startMicrosoftAuth(entry) {
             if (!code) {
                 throw new CanvasError("azure_devops_oauth_code_missing", "Microsoft sign-in did not return an authorization code.");
             }
-            const tokenResult = await requestMicrosoftToken({
-                grant_type: "authorization_code",
-                code,
-                redirect_uri: redirectUri,
-                code_verifier: pkce.verifier,
-            });
+            const tokenResult = await requestMicrosoftToken(
+                {
+                    grant_type: "authorization_code",
+                    code,
+                    redirect_uri: redirectUri,
+                    code_verifier: pkce.verifier,
+                },
+                { tenant: targetTenant },
+            );
             // The browser sign-in outlives its request too, so a sign-out during
             // it must not be undone when the user finally completes the flow.
             if (generation !== authGeneration) {
@@ -839,11 +1360,17 @@ async function startMicrosoftAuth(entry) {
                 complete("failed", "Sign-in was abandoned because the canvas was signed out.");
                 return;
             }
-            const cache = await writeBrowserTokenCache(tokenResult);
+            const cache = await writeBrowserTokenCache(tokenResult, { requestedTenant: targetTenant });
+            if (targetOrganization && cache.tenantId) {
+                rememberOrganizationTenant(targetOrganization, cache.tenantId);
+            }
             clearTimeout(timeout);
             res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
             res.end("<!doctype html><title>Signed in</title><p>Sign-in to Azure DevOps is complete. This window can be closed.</p>");
-            complete("succeeded", "Signed in to Azure DevOps with Microsoft.", { expiresAt: cache.expiresAt });
+            complete("succeeded", "Signed in to Azure DevOps with Microsoft.", {
+                expiresAt: cache.expiresAt,
+                ...(cache.tenantId ? { tenantId: cache.tenantId } : {}),
+            });
         } catch (error) {
             clearTimeout(timeout);
             const originalMessage = error instanceof CanvasError ? error.message : error?.message || "Microsoft sign-in failed.";
@@ -858,7 +1385,7 @@ async function startMicrosoftAuth(entry) {
         }
     });
 
-    const authorizeUrl = new URL(`${AZURE_AUTHORITY}/authorize`);
+    const authorizeUrl = new URL(`${authority}/authorize`);
     authorizeUrl.searchParams.set("client_id", AZURE_PUBLIC_CLIENT_ID);
     authorizeUrl.searchParams.set("response_type", "code");
     authorizeUrl.searchParams.set("redirect_uri", redirectUri);
@@ -867,13 +1394,17 @@ async function startMicrosoftAuth(entry) {
     authorizeUrl.searchParams.set("state", state);
     authorizeUrl.searchParams.set("code_challenge", pkce.challenge);
     authorizeUrl.searchParams.set("code_challenge_method", "S256");
-    authorizeUrl.searchParams.set("prompt", "select_account");
+    if (isSpecificTenantIdentifier(targetTenant) && browserPrimarySession?.loginHint) {
+        authorizeUrl.searchParams.set("login_hint", browserPrimarySession.loginHint);
+    } else {
+        authorizeUrl.searchParams.set("prompt", "select_account");
+    }
     authProcess.authorizationUrl = authorizeUrl.toString();
     openBrowser(authProcess.authorizationUrl);
     return authProcess;
 }
 
-async function startAgencyAuth(entry) {
+async function startAgencyAuth(entry, options = {}) {
     if (!AGENCY_AUTH_ENABLED) {
         throw new CanvasError(
             "azure_devops_auth_provider_unavailable",
@@ -884,6 +1415,12 @@ async function startAgencyAuth(entry) {
         return entry.authProcess;
     }
 
+    const rawTenant = normalizeString(options.tenant);
+    const explicitTenant = rawTenant ? normalizeTenantIdentifier(rawTenant) : "";
+    if (rawTenant && !explicitTenant && !normalizeString(options.organization)) {
+        // Validate or probe inside the async task if it looks like an org name;
+        // only reject malformed characters synchronously if needed.
+    }
     const azureAuthDiscovery = managedAzureAuthDiscovery();
     const authProcess = {
         provider: "azureauth",
@@ -910,7 +1447,21 @@ async function startAgencyAuth(entry) {
     void (async () => {
         try {
             const azureAuthPath = azureAuthExecutable(azureAuthDiscovery);
-            const accessToken = await acquireAzureAuthToken(azureAuthPath);
+            let targetTenant = explicitTenant;
+            if (!targetTenant && rawTenant) {
+                targetTenant = await probeOrganizationTenant(rawTenant);
+                if (!targetTenant) {
+                    throw new CanvasError(
+                        "azure_devops_invalid_tenant",
+                        "Enter a valid Entra tenant ID, domain name, or Azure DevOps organization.",
+                    );
+                }
+            } else if (!targetTenant && normalizeString(options.organization)) {
+                targetTenant = await probeOrganizationTenant(options.organization);
+            }
+            const accessToken = await acquireAzureAuthToken(azureAuthPath, undefined, {
+                tenant: targetTenant,
+            });
             // Sign-out is reachable throughout the prompt, and this work outlives
             // the request that started it. Writing a token or the marker after the
             // user signed out would silently sign them back in, and the marker
@@ -919,9 +1470,13 @@ async function startAgencyAuth(entry) {
                 complete("failed", "Sign-in was abandoned because the canvas was signed out.");
                 return;
             }
-            const cache = await writeAzureAuthTokenCache({ accessToken, source: "azureauth" });
+            const cache = await writeAzureAuthTokenCache({ accessToken, source: "azureauth", tenantId: targetTenant }, { requestedTenant: targetTenant });
+            if (normalizeString(options.organization) && cache.tenantId) {
+                rememberOrganizationTenant(options.organization, cache.tenantId);
+            }
             complete("succeeded", "AzureAuth acquired an Azure DevOps token.", {
                 expiresAt: cache.expiresAt,
+                ...(cache.tenantId ? { tenantId: cache.tenantId } : {}),
             });
             writeAgencyAuthMarker();
         } catch (error) {
@@ -942,6 +1497,7 @@ async function signOutAuth(entry) {
     // next canvas load silently re-acquire a token and sign the user straight
     // back in, which reads as the sign-out button not working.
     clearAgencyAuthMarker();
+    organizationTenantCache.clear();
     const [clearedBrowserTokenCache, clearedAzureAuthTokenCache] = await Promise.all([
         clearBrowserTokenCache(),
         clearAzureAuthTokenCache(),
@@ -1065,14 +1621,26 @@ function requireProject(config) {
 
 // `cache` names the cache that supplied the token, so a token Azure DevOps
 // rejects can be dropped from the place it came from.
-async function getRequestToken() {
+async function getRequestToken({ organization = "", tenantId = "", requireTenantMatch = false } = {}) {
+    const resolvedTenantId = normalizeTenantIdentifier(tenantId) || lookupOrganizationTenant(organization);
+    const context = {
+        tenantId: resolvedTenantId,
+        organization: normalizeString(organization),
+        requireTenantMatch,
+    };
     try {
-        return { ...(await getBrowserOAuthAccessToken()), cache: "browser-oauth" };
+        return { ...(await getBrowserOAuthAccessToken(context)), cache: "browser-oauth" };
     } catch (error) {
+        if (
+            error?.code === "azure_devops_tenant_auth_required" ||
+            error?.code === "azure_devops_tenant_token_mismatch"
+        ) {
+            throw error;
+        }
         if (!AGENCY_AUTH_ENABLED) {
             throw error;
         }
-        return { ...(await getAzureAuthAccessToken()), cache: "azureauth" };
+        return { ...(await getAzureAuthAccessToken(context)), cache: "azureauth" };
     }
 }
 
@@ -1088,8 +1656,8 @@ function authHeaders(token, extraHeaders = {}) {
     };
 }
 
-async function makeAuthHeaders(extraHeaders = {}) {
-    return authHeaders(await getRequestToken(), extraHeaders);
+async function makeAuthHeaders(extraHeaders = {}, context = {}) {
+    return authHeaders(await getRequestToken(context), extraHeaders);
 }
 
 function landedOnSignInPage(response) {
@@ -1103,9 +1671,25 @@ function landedOnSignInPage(response) {
     }
 }
 
+function locationIsSignInPage(location, baseUrl) {
+    if (!location) {
+        return false;
+    }
+    try {
+        return new URL(location, baseUrl).pathname.toLowerCase() === "/_signin";
+    } catch {
+        return false;
+    }
+}
+
+function tokenTenantGuid(token) {
+    return normalizeTenantGuid(parseJwtPayload(token?.accessToken)?.tid) || normalizeTenantGuid(token?.tenantId);
+}
+
 // Drops the token Azure DevOps refused, unless a newer one has replaced it since,
-// so the auth state reports signed out and the UI offers sign-in again. Only the
-// token is dropped: the AzureAuth marker and connection preference are kept.
+// so the auth state reports signed out when no valid tenant credentials remain.
+// Scoped to the refused token's tenant bucket so an unrelated tenant failure
+// never evicts a working tenant session.
 function rejectAuthentication(response, token) {
     const claims = parseJwtPayload(token.accessToken) || {};
     const resourceTenant = normalizeString(response.headers?.get?.("x-vss-resourcetenant"));
@@ -1114,20 +1698,55 @@ function rejectAuthentication(response, token) {
         + `(status ${response.status}; tid=${normalizeString(claims.tid)}; iss=${normalizeString(claims.iss)}; `
         + `idtyp=${normalizeString(claims.idtyp)}; x-vss-resourcetenant=${resourceTenant}).`,
     ).catch(() => {});
-    if (token.cache === "browser-oauth" && browserTokenCache?.accessToken === token.accessToken) {
-        browserTokenCache = null;
+    const bucketKey = token.tenantKey || resolveTokenBucketKey(token.accessToken);
+    if (token.cache === "browser-oauth") {
+        const current = browserTokensByTenant.get(bucketKey);
+        if (current?.accessToken === token.accessToken) {
+            browserTokensByTenant.delete(bucketKey);
+            if (browserTokensByTenant.size === 0) {
+                browserPrimarySession = null;
+            } else if (browserPrimarySession?.homeTenantKey === bucketKey) {
+                const nextKey = browserTokensByTenant.keys().next().value || "";
+                browserPrimarySession = nextKey
+                    ? { ...browserPrimarySession, homeTenantKey: nextKey }
+                    : null;
+            }
+        }
     }
-    if (token.cache === "azureauth" && azureAuthTokenCache?.accessToken === token.accessToken) {
-        azureAuthTokenCache = null;
+    if (token.cache === "azureauth") {
+        const current = azureAuthTokensByTenant.get(bucketKey);
+        if (current?.accessToken === token.accessToken) {
+            azureAuthTokensByTenant.delete(bucketKey);
+        }
     }
     return new CanvasError("azure_devops_authentication_rejected", "Azure DevOps did not accept the sign-in. Sign in again.");
 }
 
-async function readAzureDevOpsJson(response, token) {
+function maybeResourceTenantChallenge(response, token, allowTenantChallenge) {
+    if (!allowTenantChallenge) {
+        return null;
+    }
+    const resourceTenant = extractResourceTenant(response);
+    const currentTenant = tokenTenantGuid(token);
+    if (resourceTenant && resourceTenant !== currentTenant) {
+        return Object.assign(new Error("Azure DevOps resource tenant challenge."), {
+            code: "azure_devops_resource_tenant_challenge",
+            resourceTenant,
+        });
+    }
+    return null;
+}
+
+async function readAzureDevOpsJson(response, token, { allowTenantChallenge = false } = {}) {
     // A valid sign-in outside the organization also gets a 401, but Azure DevOps
     // names that caller in x-vss-userdata. Only an unidentified 401 is a refused token.
     const anonymous = response.status === 401 && !response.headers?.get?.("x-vss-userdata");
     if (anonymous || landedOnSignInPage(response)) {
+        const challenge = maybeResourceTenantChallenge(response, token, allowTenantChallenge);
+        if (challenge) {
+            void response.body?.cancel?.()?.catch?.(() => {});
+            throw challenge;
+        }
         throw rejectAuthentication(response, token);
     }
     const text = await response.text();
@@ -1139,6 +1758,10 @@ async function readAzureDevOpsJson(response, token) {
             // A successful status with a non-JSON body is the anonymous sign-in
             // page, not data.
             if (response.ok) {
+                const challenge = maybeResourceTenantChallenge(response, token, allowTenantChallenge);
+                if (challenge) {
+                    throw challenge;
+                }
                 throw rejectAuthentication(response, token);
             }
             data = { message: text };
@@ -1165,23 +1788,82 @@ function buildApiUrl(config, path, params = {}, apiVersion = config.apiVersion |
 
 async function fetchJson(config, path, options = {}) {
     const url = buildApiUrl(config, path, options.params, options.apiVersion);
-    const token = await getRequestToken();
+    const organization = normalizeString(config.organization);
+    const token = await getRequestToken({ organization });
     const response = await fetch(url, {
         method: options.method || "GET",
         headers: authHeaders(token, options.headers),
         body: options.body,
     });
-    return readAzureDevOpsJson(response, token);
+    const advertisedTenant = extractResourceTenant(response);
+    if (organization && advertisedTenant) {
+        rememberOrganizationTenant(organization, advertisedTenant);
+    }
+    try {
+        return await readAzureDevOpsJson(response, token, { allowTenantChallenge: true });
+    } catch (error) {
+        if (error?.code !== "azure_devops_resource_tenant_challenge") {
+            throw error;
+        }
+        const challengedTenant = error.resourceTenant;
+        void copilotSession?.log?.(
+            `Azure DevOps canvas: organization "${organization}" requires resource tenant ${challengedTenant}; exchanging token.`,
+        ).catch(() => {});
+        let retryToken;
+        try {
+            retryToken = await getRequestToken({
+                organization,
+                tenantId: challengedTenant,
+                requireTenantMatch: true,
+            });
+        } catch (exchangeError) {
+            if (exchangeError?.code === "azure_devops_tenant_token_mismatch") {
+                throw rejectAuthentication(response, token);
+            }
+            throw exchangeError;
+        }
+        const retryResponse = await fetch(url, {
+            method: options.method || "GET",
+            headers: authHeaders(retryToken, options.headers),
+            body: options.body,
+        });
+        const retryTenant = extractResourceTenant(retryResponse);
+        if (organization && retryTenant) {
+            rememberOrganizationTenant(organization, retryTenant);
+        }
+        return readAzureDevOpsJson(retryResponse, retryToken, { allowTenantChallenge: false });
+    }
 }
 
 async function fetchImageDataUri(config, path, options = {}) {
     const url = buildApiUrl(config, path, options.params, options.apiVersion);
-    const response = await fetch(url, {
-        headers: await makeAuthHeaders({
-            Accept: "image/svg+xml,image/png",
-            ...options.headers,
-        }),
-    });
+    const organization = normalizeString(config.organization);
+    const extraHeaders = {
+        Accept: "image/svg+xml,image/png",
+        ...options.headers,
+    };
+    let token = await getRequestToken({ organization });
+    let response = await fetch(url, { headers: authHeaders(token, extraHeaders) });
+    const advertisedTenant = extractResourceTenant(response);
+    if (organization && advertisedTenant) {
+        rememberOrganizationTenant(organization, advertisedTenant);
+    }
+    const anonymous = response.status === 401 && !response.headers?.get?.("x-vss-userdata");
+    if ((anonymous || landedOnSignInPage(response)) && advertisedTenant && advertisedTenant !== tokenTenantGuid(token)) {
+        void response.body?.cancel?.()?.catch?.(() => {});
+        try {
+            token = await getRequestToken({
+                organization,
+                tenantId: advertisedTenant,
+                requireTenantMatch: true,
+            });
+            response = await fetch(url, { headers: authHeaders(token, extraHeaders) });
+        } catch (error) {
+            if (error?.code !== "azure_devops_tenant_token_mismatch") {
+                throw error;
+            }
+        }
+    }
     if (!response.ok) {
         throw new CanvasError(
             "azure_devops_request_failed",
@@ -1301,13 +1983,41 @@ function validateAttachmentUrl(config, value) {
 
 async function fetchImage(config, value, kind) {
     const imageUrl = validateImageUrl(config, value, kind);
+    const organization = normalizeString(config.organization);
     const label = kind === "attachment" ? "attachment" : "profile image";
     const maxBytes = kind === "attachment" ? 8 * 1024 * 1024 : MAX_AVATAR_BYTES;
     const imageTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
     if (kind === "attachment") imageTypes.push("image/bmp");
     const failure = (suffix, message) => new CanvasError(`azure_devops_${kind}_${suffix}`, message);
-    const headers = await makeAuthHeaders({ Accept: imageTypes.join(",") });
+    const acceptHeaders = { Accept: imageTypes.join(",") };
+    let token = await getRequestToken({ organization });
+    let headers = authHeaders(token, acceptHeaders);
     let response = await fetch(imageUrl, { headers, redirect: "manual" });
+    const advertisedTenant = extractResourceTenant(response);
+    if (organization && advertisedTenant) {
+        rememberOrganizationTenant(organization, advertisedTenant);
+    }
+    const isRedirect = [301, 302, 303, 307, 308].includes(response.status);
+    const redirectLocation = isRedirect ? normalizeString(response.headers.get("location")) : "";
+    const anonymousChallenge =
+        (response.status === 401 && !response.headers?.get?.("x-vss-userdata")) ||
+        (isRedirect && locationIsSignInPage(redirectLocation, imageUrl));
+    if (anonymousChallenge && advertisedTenant && advertisedTenant !== tokenTenantGuid(token)) {
+        void response.body?.cancel?.()?.catch?.(() => {});
+        try {
+            token = await getRequestToken({
+                organization,
+                tenantId: advertisedTenant,
+                requireTenantMatch: true,
+            });
+            headers = authHeaders(token, acceptHeaders);
+            response = await fetch(imageUrl, { headers, redirect: "manual" });
+        } catch (error) {
+            if (error?.code !== "azure_devops_tenant_token_mismatch") {
+                throw error;
+            }
+        }
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = normalizeString(response.headers.get("location"));
         if (!location) {
@@ -2697,7 +3407,10 @@ async function getPullRequestCommentCounts(config, project, repositoryId, pullRe
         return value;
     }).catch((error) => {
         pullRequestCommentCountCache.delete(cacheKey);
-        if (error?.code === "azure_devops_authentication_rejected") {
+        if (
+            error?.code === "azure_devops_authentication_rejected" ||
+            error?.code === "azure_devops_tenant_auth_required"
+        ) {
             throw error;
         }
         void copilotSession?.log?.(
@@ -2883,7 +3596,10 @@ async function mapWorkItemSummaries(config, project, workItems) {
     try {
         appearances = await getWorkItemTypeAppearances(config, project);
     } catch (error) {
-        if (error?.code === "azure_devops_authentication_rejected") {
+        if (
+            error?.code === "azure_devops_authentication_rejected" ||
+            error?.code === "azure_devops_tenant_auth_required"
+        ) {
             throw error;
         }
         void copilotSession?.log?.(
@@ -2978,7 +3694,10 @@ async function filterOpenWorkItems(config, workItems, top) {
         try {
             states.set(project.toLowerCase(), await getTerminalWorkItemStates(config, project));
         } catch (error) {
-            if (error?.code === "azure_devops_authentication_rejected") {
+            if (
+                error?.code === "azure_devops_authentication_rejected" ||
+                error?.code === "azure_devops_tenant_auth_required"
+            ) {
                 throw error;
             }
             // A project whose definitions cannot be read is left unfiltered rather
@@ -3374,7 +4093,10 @@ function homeSection(result, fallback) {
     if (result.status === "fulfilled") {
         return { ...fallback, ...result.value, error: "" };
     }
-    if (result.reason?.code === "azure_devops_authentication_rejected") {
+    if (
+        result.reason?.code === "azure_devops_authentication_rejected" ||
+        result.reason?.code === "azure_devops_tenant_auth_required"
+    ) {
         throw result.reason;
     }
     return {
@@ -3400,7 +4122,39 @@ async function getConnectionOverview(connection, overrides = {}) {
             : Promise.resolve({ boards: [], count: 0, requiresProject: true }),
         queryMyOpenWorkItems({ ...scoped, top }),
     ]);
+
+    const results = [pullRequestResult, boardResult, workItemResult];
+    const tenantChallenge = results.find((entry) => entry.status === "rejected" && entry.reason?.code === "azure_devops_tenant_auth_required")?.reason;
+    const rejectedSignIn = results.find((entry) => entry.status === "rejected" && entry.reason?.code === "azure_devops_authentication_rejected")?.reason;
+    if (tenantChallenge || rejectedSignIn) {
+        if (rejectedSignIn && !(await getAuthState()).isAuthenticated) {
+            throw rejectedSignIn;
+        }
+        const challenge = tenantChallenge || rejectedSignIn;
+        const tenantId = normalizeTenantIdentifier(challenge?.tenantId) || lookupOrganizationTenant(config.organization);
+        return {
+            source: connection.source,
+            isDefault: Boolean(connection.isDefault),
+            isRemote: connection.source === CONNECTION_SOURCE_REMOTE,
+            requiresProject: !project,
+            organization: config.organization,
+            project,
+            repositoryId: config.repositoryId,
+            ...(tenantId ? { tenantId } : {}),
+            authRequired: {
+                organization: config.organization,
+                ...(tenantId ? { tenantId } : {}),
+                message: normalizeString(challenge?.message)
+                    || `Additional directory sign-in is required to access "${config.organization}".`,
+            },
+            myPullRequests: { pullRequests: [], count: 0, scope: config.repositoryId || project, error: "" },
+            myBoards: { boards: [], count: 0, scope: project, error: "" },
+            myWorkItems: { workItems: [], count: 0, scope: project || config.organization, error: "" },
+        };
+    }
+
     const pullRequests = homeSection(pullRequestResult, { pullRequests: [], count: 0 });
+    const resolvedTenantId = lookupOrganizationTenant(config.organization);
     return {
         source: connection.source,
         isDefault: Boolean(connection.isDefault),
@@ -3411,6 +4165,7 @@ async function getConnectionOverview(connection, overrides = {}) {
         organization: config.organization,
         project,
         repositoryId: config.repositoryId,
+        ...(resolvedTenantId ? { tenantId: resolvedTenantId } : {}),
         // Pull requests are scoped to the repository, work items to the project,
         // or to the whole organization when no project is selected.
         myPullRequests: {
@@ -4505,7 +5260,7 @@ async function listRepositories(overrides = {}) {
 // cannot go through buildApiUrl: there is no organization yet to build a base
 // URL from. That is the whole point of this call — it is what the picker uses
 // when the canvas has no connection at all.
-async function fetchVsspsJson(path, params = {}) {
+async function fetchVsspsJson(path, params = {}, { tenantId = "", requireTenantMatch = false } = {}) {
     const url = new URL(path, `${VSSPS_BASE_URL}/`);
     url.searchParams.set("api-version", DEFAULT_API_VERSION);
     for (const [key, value] of Object.entries(params)) {
@@ -4513,39 +5268,165 @@ async function fetchVsspsJson(path, params = {}) {
             url.searchParams.set(key, String(value));
         }
     }
-    const token = await getRequestToken();
+    const token = await getRequestToken({ tenantId, requireTenantMatch });
     const response = await fetch(url, { headers: authHeaders(token) });
-    return readAzureDevOpsJson(response, token);
-}
-
-// Two calls: the profile resolves the member id that the accounts call filters
-// on. Listing accounts is a convenience, not a requirement — a tenant that
-// refuses it leaves the picker on free-text organization entry, which still
-// works — so the failure is reported alongside an empty list rather than thrown.
-async function listOrganizations() {
     try {
-        const profile = await fetchVsspsJson("_apis/profile/profiles/me");
-        const memberId = normalizeString(profile?.id || profile?.publicAlias);
-        if (!memberId) {
-            return { organizations: [], error: "Azure DevOps did not return a profile id." };
-        }
-        const data = await fetchVsspsJson("_apis/accounts", { memberId });
-        const organizations = (data.value || [])
-            .map((account) => ({
-                name: normalizeString(account?.accountName),
-                id: normalizeString(account?.accountId),
-            }))
-            .filter((account) => account.name)
-            .sort((left, right) => left.name.localeCompare(right.name));
-        return { organizations, error: "" };
+        return await readAzureDevOpsJson(response, token, { allowTenantChallenge: !tenantId });
     } catch (error) {
-        // A refused sign-in is not a refused accounts call: the token has been
-        // dropped, so the canvas has to go back to sign-in rather than free text.
-        if (error?.code === "azure_devops_authentication_rejected") {
+        if (error?.code !== "azure_devops_resource_tenant_challenge") {
             throw error;
         }
-        return { organizations: [], error: normalizeString(error?.message) || "Could not list Azure DevOps organizations." };
+        let retryToken;
+        try {
+            retryToken = await getRequestToken({
+                tenantId: error.resourceTenant,
+                requireTenantMatch: true,
+            });
+        } catch (exchangeError) {
+            if (exchangeError?.code === "azure_devops_tenant_token_mismatch") {
+                throw rejectAuthentication(response, token);
+            }
+            throw exchangeError;
+        }
+        const retryResponse = await fetch(url, { headers: authHeaders(retryToken) });
+        return readAzureDevOpsJson(retryResponse, retryToken, { allowTenantChallenge: false });
     }
+}
+
+async function discoverManagementTenants() {
+    const refreshToken = findAnyRefreshToken();
+    if (!refreshToken) {
+        return [];
+    }
+    try {
+        const tokenData = await requestMicrosoftToken(
+            {
+                grant_type: "refresh_token",
+                refresh_token: refreshToken,
+            },
+            {
+                tenant: AZURE_DEFAULT_TENANT,
+                scope: AZURE_MANAGEMENT_SCOPE,
+            },
+        );
+        const accessToken = normalizeString(tokenData?.access_token);
+        if (!accessToken) {
+            return [];
+        }
+        if (normalizeString(tokenData?.refresh_token) && browserPrimarySession) {
+            browserPrimarySession = {
+                ...browserPrimarySession,
+                refreshToken: normalizeString(tokenData.refresh_token),
+            };
+        }
+        const response = await fetch(AZURE_MANAGEMENT_TENANTS_URL, {
+            headers: authHeaders({ accessToken }),
+        });
+        if (!response.ok) {
+            void response.body?.cancel?.()?.catch?.(() => {});
+            return [];
+        }
+        const data = await response.json();
+        return [...new Set(
+            (data?.value || [])
+                .map((entry) => normalizeTenantGuid(entry?.tenantId))
+                .filter(Boolean),
+        )];
+    } catch {
+        return [];
+    }
+}
+
+async function listOrganizationsForTenant(tenantId = "") {
+    const requireTenantMatch = Boolean(normalizeTenantGuid(tenantId));
+    const profile = await fetchVsspsJson("_apis/profile/profiles/me", {}, {
+        tenantId,
+        requireTenantMatch,
+    });
+    const memberId = normalizeString(profile?.id || profile?.publicAlias);
+    if (!memberId) {
+        return { organizations: [], error: "Azure DevOps did not return a profile id." };
+    }
+    const data = await fetchVsspsJson("_apis/accounts", { memberId }, {
+        tenantId,
+        requireTenantMatch,
+    });
+    const resolvedTenant = normalizeTenantGuid(tenantId);
+    const organizations = (data.value || [])
+        .map((account) => {
+            const name = normalizeString(account?.accountName);
+            const accountTenant = normalizeTenantGuid(account?.organizationTenantId) || resolvedTenant;
+            if (name && accountTenant) {
+                rememberOrganizationTenant(name, accountTenant);
+            }
+            return {
+                name,
+                id: normalizeString(account?.accountId),
+                ...(accountTenant ? { tenantId: accountTenant } : {}),
+            };
+        })
+        .filter((account) => account.name);
+    return { organizations, error: "" };
+}
+
+// Two calls per tenant: the profile resolves the member id that the accounts
+// call filters on, and accessible B2B guest tenants are queried alongside the
+// primary session so organizations hosted outside a default M365 tenant appear.
+// Listing accounts is a convenience, not a requirement — a tenant that refuses
+// it leaves the picker on free-text organization entry, which still works.
+async function listOrganizations() {
+    const byName = new Map();
+    const recordOrganizations = (items) => {
+        for (const item of items) {
+            const key = item.name.toLowerCase();
+            const existing = byName.get(key);
+            if (!existing || (!existing.tenantId && item.tenantId)) {
+                byName.set(key, item);
+            }
+        }
+    };
+
+    let primaryError = "";
+    let primaryTenantId = "";
+    try {
+        const defaultToken = await getRequestToken();
+        primaryTenantId = tokenTenantGuid(defaultToken);
+        const primaryResult = await listOrganizationsForTenant(primaryTenantId);
+        recordOrganizations(primaryResult.organizations);
+        primaryError = primaryResult.error;
+    } catch (error) {
+        if (error?.code === "azure_devops_authentication_rejected" && !(await getAuthState()).isAuthenticated) {
+            throw error;
+        }
+        primaryError = normalizeString(error?.message) || "Could not list Azure DevOps organizations.";
+    }
+
+    const candidateTenants = new Set([
+        ...listAuthenticatedTenants(browserTokensByTenant),
+        ...listAuthenticatedTenants(azureAuthTokensByTenant),
+        ...organizationTenantCache.values(),
+        ...(await discoverManagementTenants()),
+    ]);
+    if (primaryTenantId) {
+        candidateTenants.delete(primaryTenantId);
+    }
+
+    if (candidateTenants.size > 0) {
+        const extraResults = await Promise.allSettled(
+            [...candidateTenants].map((tenantId) => listOrganizationsForTenant(tenantId)),
+        );
+        for (const result of extraResults) {
+            if (result.status === "fulfilled") {
+                recordOrganizations(result.value.organizations);
+            }
+        }
+    }
+
+    const organizations = [...byName.values()].sort((left, right) => left.name.localeCompare(right.name));
+    return {
+        organizations,
+        error: organizations.length > 0 ? "" : primaryError,
+    };
 }
 
 async function listProjects(overrides = {}) {
@@ -4562,11 +5443,13 @@ async function listProjects(overrides = {}) {
 }
 
 function connectionSummary(connection) {
+    const tenantId = normalizeTenantGuid(connection.tenantId) || lookupOrganizationTenant(connection.organization);
     return {
         source: connection.source,
         organization: connection.organization,
         project: connection.project,
         repositoryId: connection.repositoryId,
+        ...(tenantId ? { tenantId } : {}),
         isDefault: Boolean(connection.isDefault),
         isRemote: connection.source === CONNECTION_SOURCE_REMOTE,
         // Pull requests need a project; the canvas offers to pick one when a
@@ -4836,10 +5719,19 @@ async function readRequestBody(req, { allowEmpty = false } = {}) {
 }
 
 function errorPayload(error) {
-    return {
+    const payload = {
         error: error instanceof CanvasError ? error.code : "azure_devops_unexpected_error",
         message: error?.message || "Unexpected Azure DevOps canvas error.",
     };
+    if (error instanceof CanvasError) {
+        if (normalizeString(error.tenantId)) {
+            payload.tenantId = normalizeString(error.tenantId);
+        }
+        if (normalizeString(error.organization)) {
+            payload.organization = normalizeString(error.organization);
+        }
+    }
+    return payload;
 }
 
 function headerValue(value) {
@@ -4992,10 +5884,14 @@ async function handleApi(entry, req, res, url) {
                         : "Select Microsoft sign-in.",
                 );
             }
+            const authOptions = {
+                tenant: normalizeString(body.tenant || body.tenantId),
+                organization: normalizeString(body.organization || body.org),
+            };
             jsonResponse(res, 200, {
                 authProcess: provider === "microsoft"
-                    ? await startMicrosoftAuth(entry)
-                    : await startAgencyAuth(entry),
+                    ? await startMicrosoftAuth(entry, authOptions)
+                    : await startAgencyAuth(entry, authOptions),
             });
             return;
         }

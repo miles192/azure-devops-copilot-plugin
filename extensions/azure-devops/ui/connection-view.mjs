@@ -152,7 +152,7 @@ function field(id, label, hint, { onInput, onCommit }) {
 }
 
 export function renderConnectionPanel(container, state, handlers) {
-    const { onDraftChange, onOrganizationCommitted, onSave, onClearDefault, onCancel } = handlers;
+    const { onDraftChange, onOrganizationCommitted, onAuthorizeTenant, onSave, onClearDefault, onCancel } = handlers;
     container.replaceChildren();
 
     const panel = element("section", "connection-panel");
@@ -196,6 +196,22 @@ export function renderConnectionPanel(container, state, handlers) {
     );
     form.append(pin);
 
+    let currentTenantAuth = null;
+    const authPrompt = element("div", "connection-auth-prompt");
+    authPrompt.setAttribute("role", "status");
+    authPrompt.hidden = true;
+    const authPromptMessage = element("div", "connection-auth-prompt-message");
+    const authPromptActions = element("div", "connection-auth-prompt-actions");
+    const authorize = element("button", "secondary", "Sign in to directory");
+    authorize.type = "button";
+    authorize.addEventListener("click", () => {
+        if (currentTenantAuth && onAuthorizeTenant) {
+            onAuthorizeTenant(currentTenantAuth);
+        }
+    });
+    authPromptActions.append(authorize);
+    authPrompt.append(authPromptMessage, authPromptActions);
+
     const error = element("div", "connection-error");
     const actions = element("div", "connection-actions");
     const save = element("button", "", "Use this organization");
@@ -207,7 +223,7 @@ export function renderConnectionPanel(container, state, handlers) {
     cancel.type = "button";
     cancel.addEventListener("click", onCancel);
     actions.append(save, clear, cancel);
-    form.append(error, actions);
+    form.append(authPrompt, error, actions);
 
     form.addEventListener("submit", (event) => {
         event.preventDefault();
@@ -226,6 +242,8 @@ export function renderConnectionPanel(container, state, handlers) {
             draft = {},
             loading = "",
             error: errorText = "",
+            tenantAuthRequired = null,
+            authorizingTenant = false,
             saving = false,
             hasDefault = false,
             firstRun = false,
@@ -278,14 +296,24 @@ export function renderConnectionPanel(container, state, handlers) {
         project.input.placeholder = loading === "options" ? "Loading projects..." : "Optional";
         repository.input.placeholder = loading === "options" ? "Loading repositories..." : "Optional";
 
+        currentTenantAuth = draft.organization ? tenantAuthRequired : null;
+        authPrompt.hidden = !currentTenantAuth;
+        if (currentTenantAuth) {
+            authPromptMessage.textContent = currentTenantAuth.message
+                || `Additional directory sign-in is required to access "${draft.organization}".`;
+            authorize.textContent = authorizingTenant ? "Signing in..." : "Sign in to directory";
+            authorize.disabled = saving || authorizingTenant;
+            authorize.hidden = !onAuthorizeTenant;
+        }
+
         error.textContent = errorText;
         error.hidden = !errorText;
         save.textContent = saving ? "Saving..." : "Use this organization";
-        save.disabled = saving || !draft.organization;
+        save.disabled = saving || authorizingTenant || !draft.organization;
         clear.hidden = !hasDefault;
-        clear.disabled = saving;
+        clear.disabled = saving || authorizingTenant;
         cancel.hidden = firstRun;
-        cancel.disabled = saving;
+        cancel.disabled = saving || authorizingTenant;
     };
 
     update(state);

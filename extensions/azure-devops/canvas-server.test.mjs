@@ -4762,3 +4762,416 @@ test("image proxy regression: avatars retain their MIME and 2 MiB limits", async
         );
     });
 });
+
+function makeSyntheticJwt(claims) {
+    return [
+        Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+        Buffer.from(JSON.stringify({
+            exp: Math.floor(Date.now() / 1000) + 3600,
+            idtyp: "user",
+            ...claims,
+        })).toString("base64url"),
+        "signature",
+    ].join(".");
+}
+
+const TENANT_HOME_M365 = "11111111-1111-1111-1111-111111111111";
+const TENANT_DEVOPS_B2B = "22222222-2222-2222-2222-222222222222";
+const TENANT_DEVOPS_SECOND = "33333333-3333-3333-3333-333333333333";
+
+test("B2B organization challenge exchanges the home-tenant refresh token against X-VSS-ResourceTenant and deduplicates concurrent exchanges", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth invocation"));
+    const homeToken = makeSyntheticJwt({ tid: TENANT_HOME_M365, preferred_username: "avery@contoso.example" });
+    const devopsToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_B2B, preferred_username: "avery@contoso.example" });
+    const tokenCalls = [];
+    const adoCalls = [];
+
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: {
+            access_token: homeToken,
+            refresh_token: "family-refresh-token",
+            expires_in: 3600,
+        },
+        fetchImpl: async (url, options = {}) => {
+            const parsed = new URL(url);
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname.endsWith("/token")) {
+                const body = options.body instanceof URLSearchParams ? options.body : new URLSearchParams(String(options.body || ""));
+                tokenCalls.push({ pathname: parsed.pathname, grantType: body.get("grant_type"), refreshToken: body.get("refresh_token") });
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                if (parsed.pathname === `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/token`) {
+                    return jsonStatusResponse(200, {
+                        access_token: devopsToken,
+                        refresh_token: "rotated-family-refresh",
+                        expires_in: 3600,
+                    });
+                }
+                return jsonStatusResponse(400, { error: "invalid_request" });
+            }
+            const authorization = options.headers?.Authorization || "";
+            adoCalls.push({ pathname: parsed.pathname, authorization });
+            if (authorization !== `Bearer ${devopsToken}`) {
+                return jsonStatusResponse(
+                    401,
+                    { message: "TF400813: The user '' is not authorized to access this resource." },
+                    { "x-vss-resourcetenant": TENANT_DEVOPS_B2B },
+                );
+            }
+            if (parsed.pathname.endsWith("/_apis/projects")) {
+                return jsonStatusResponse(200, { value: [{ id: "p-1", name: "Platform" }] }, { "x-vss-resourcetenant": TENANT_DEVOPS_B2B });
+            }
+            if (parsed.pathname.endsWith("/_apis/git/repositories")) {
+                return jsonStatusResponse(200, { value: [{ id: "r-1", name: "platform-api", project: { name: "Platform" } }] }, { "x-vss-resourcetenant": TENANT_DEVOPS_B2B });
+            }
+            return jsonStatusResponse(404, { message: "Not found" });
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        const [projectsRes, reposRes] = await Promise.all([
+            authed(canvas, "/api/projects?organization=fabrikam"),
+            authed(canvas, "/api/repositories?organization=fabrikam"),
+        ]);
+        assert.equal(projectsRes.status, 200);
+        assert.equal(reposRes.status, 200);
+        assert.deepEqual((await projectsRes.json()).projects, [{ id: "p-1", name: "Platform" }]);
+        assert.equal((await reposRes.json()).repositories[0].name, "platform-api");
+        assert.equal(tokenCalls.length, 1, "concurrent challenges for the same B2B tenant share one refresh-token exchange");
+        assert.equal(tokenCalls[0].pathname, `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/token`);
+
+        // A subsequent request to fabrikam uses the cached resource-tenant mapping directly with no 401 round-trip.
+        const countBefore = adoCalls.length;
+        const cachedProjects = await authed(canvas, "/api/projects?organization=fabrikam");
+        assert.equal(cachedProjects.status, 200);
+        assert.equal(adoCalls.length, countBefore + 1);
+        assert.equal(adoCalls.at(-1).authorization, `Bearer ${devopsToken}`);
+
+        const authStatus = await canvas.authStatus();
+        assert.equal(authStatus.auth.isAuthenticated, true);
+        assert.deepEqual(
+            [...authStatus.auth.authenticatedTenants].sort(),
+            [TENANT_HOME_M365, TENANT_DEVOPS_B2B],
+            "both the default M365 tenant and B2B DevOps tenant remain cached simultaneously",
+        );
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});
+
+test("WWW-Authenticate authorization_uri challenges also resolve the backing resource tenant", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth invocation"));
+    const homeToken = makeSyntheticJwt({ tid: TENANT_HOME_M365 });
+    const devopsToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_B2B });
+
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: {
+            access_token: homeToken,
+            refresh_token: "family-refresh-token",
+            expires_in: 3600,
+        },
+        fetchImpl: async (url, options = {}) => {
+            const parsed = new URL(url);
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname === `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/token`) {
+                return jsonStatusResponse(200, { access_token: devopsToken, refresh_token: "family-refresh-token", expires_in: 3600 });
+            }
+            if (options.headers?.Authorization !== `Bearer ${devopsToken}`) {
+                return jsonStatusResponse(401, { message: "Unauthorized" }, {
+                    "WWW-Authenticate": `Bearer authorization_uri=https://login.microsoftonline.com/${TENANT_DEVOPS_B2B}`,
+                });
+            }
+            return jsonStatusResponse(200, { value: [{ id: "p-2", name: "Core" }] });
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        const res = await authed(canvas, "/api/projects?organization=northwind");
+        assert.equal(res.status, 200);
+        assert.deepEqual((await res.json()).projects, [{ id: "p-2", name: "Core" }]);
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});
+
+test("initial and step-up Microsoft sign-in probe the target organization's tenant and reject malformed tenant hints", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth invocation"));
+    const devopsToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_B2B, preferred_username: "avery@contoso.example" });
+    const secondToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_SECOND, preferred_username: "avery@contoso.example" });
+    const probedUrls = [];
+    const tokenAuthorities = [];
+
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        fetchImpl: async (url) => {
+            const parsed = new URL(url);
+            if (parsed.host === "dev.azure.com" && parsed.pathname.endsWith("/_apis/connectionData")) {
+                probedUrls.push(parsed.pathname);
+                const tenant = parsed.pathname.startsWith("/fabrikam/") ? TENANT_DEVOPS_B2B : TENANT_DEVOPS_SECOND;
+                return jsonStatusResponse(401, { message: "Sign in" }, { "x-vss-resourcetenant": tenant });
+            }
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname.endsWith("/token")) {
+                tokenAuthorities.push(parsed.pathname);
+                const token = parsed.pathname.includes(TENANT_DEVOPS_SECOND) ? secondToken : devopsToken;
+                return jsonStatusResponse(200, { access_token: token, refresh_token: "refresh-1", expires_in: 3600 });
+            }
+            return jsonStatusResponse(404, {});
+        },
+    });
+    const canvas = await startCanvas(namespace, {}, {
+        pullRequestUrl: "https://dev.azure.com/fabrikam/Widgets/_git/widgets-api/pullrequest/42",
+    });
+    try {
+        const invalidRes = await authed(canvas, "/api/auth/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ provider: "microsoft", tenant: "https://evil.example/tenant" }),
+        });
+        assert.equal(invalidRes.status, 400);
+        assert.equal((await invalidRes.json()).error, "azure_devops_invalid_tenant");
+
+        const started = await authed(canvas, "/api/auth/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ provider: "microsoft" }),
+        }).then((res) => res.json());
+        const authorizeUrl = new URL(started.authProcess.authorizationUrl);
+        assert.equal(authorizeUrl.pathname, `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/authorize`, "deep-linked org probes and targets its B2B tenant on first sign-in");
+        assert.equal(authorizeUrl.searchParams.get("prompt"), "select_account");
+        assert.deepEqual(probedUrls, ["/fabrikam/_apis/connectionData"]);
+
+        const callback = new URL(started.authProcess.redirectUri);
+        callback.searchParams.set("code", "code-1");
+        callback.searchParams.set("state", authorizeUrl.searchParams.get("state"));
+        await fetch(callback).then((res) => res.text());
+        assert.equal(tokenAuthorities[0], `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/token`);
+
+        // Step-up sign-in to a second tenant uses login_hint from the signed-in user.
+        const stepUp = await authed(canvas, "/api/auth/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ provider: "microsoft", organization: "northwind" }),
+        }).then((res) => res.json());
+        const stepUpUrl = new URL(stepUp.authProcess.authorizationUrl);
+        assert.equal(stepUpUrl.pathname, `/${TENANT_DEVOPS_SECOND}/oauth2/v2.0/authorize`);
+        assert.equal(stepUpUrl.searchParams.get("login_hint"), "avery@contoso.example");
+        assert.equal(stepUpUrl.searchParams.get("prompt"), null);
+
+        const stepUpCallback = new URL(stepUp.authProcess.redirectUri);
+        stepUpCallback.searchParams.set("code", "code-2");
+        stepUpCallback.searchParams.set("state", stepUpUrl.searchParams.get("state"));
+        await fetch(stepUpCallback).then((res) => res.text());
+        assert.equal(tokenAuthorities[1], `/${TENANT_DEVOPS_SECOND}/oauth2/v2.0/token`);
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});
+
+test("multi-connection Home isolates a second tenant requiring interactive MFA while keeping the first tenant active", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth invocation"));
+    const homeToken = makeSyntheticJwt({ tid: TENANT_HOME_M365 });
+    const b2bToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_B2B });
+
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: {
+            access_token: homeToken,
+            refresh_token: "family-refresh-token",
+            expires_in: 3600,
+        },
+        fetchImpl: async (url, options = {}) => {
+            const parsed = new URL(url);
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname === `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/token`) {
+                return jsonStatusResponse(200, { access_token: b2bToken, refresh_token: "family-refresh-token", expires_in: 3600 });
+            }
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname === `/${TENANT_DEVOPS_SECOND}/oauth2/v2.0/token`) {
+                return jsonStatusResponse(400, {
+                    error: "interaction_required",
+                    error_description: "AADSTS50076: Due to a configuration change made by your administrator, you must use multi-factor authentication.",
+                });
+            }
+            const auth = options.headers?.Authorization || "";
+            if (parsed.pathname.startsWith("/contoso/")) {
+                if (auth !== `Bearer ${b2bToken}`) {
+                    return jsonStatusResponse(401, { message: "Unauthorized" }, { "x-vss-resourcetenant": TENANT_DEVOPS_B2B });
+                }
+                if (parsed.pathname.endsWith("/_apis/wit/wiql")) {
+                    return jsonStatusResponse(200, { workItems: [{ id: 101 }] });
+                }
+                if (parsed.pathname.endsWith("/_apis/wit/workitems")) {
+                    return jsonStatusResponse(200, {
+                        value: [{
+                            id: 101,
+                            fields: {
+                                "System.Id": 101,
+                                "System.Title": "Ship multi-tenant support",
+                                "System.State": "Active",
+                                "System.WorkItemType": "Task",
+                                "System.TeamProject": "Engineering",
+                                "System.ChangedDate": "2026-11-25T00:00:00Z",
+                            },
+                        }],
+                    });
+                }
+                if (parsed.pathname.includes("/workitemtypes")) {
+                    return jsonStatusResponse(200, {
+                        value: [{ name: "Task", states: [{ name: "Closed", category: "Completed" }] }],
+                    });
+                }
+                return jsonStatusResponse(200, { value: [] });
+            }
+            if (parsed.pathname.startsWith("/northwind/")) {
+                return jsonStatusResponse(401, { message: "Unauthorized" }, { "x-vss-resourcetenant": TENANT_DEVOPS_SECOND });
+            }
+            return jsonStatusResponse(404, {});
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization: "northwind", isDefault: true }),
+        });
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization: "contoso", isDefault: false }),
+        });
+
+        const homeRes = await authed(canvas, "/api/home");
+        assert.equal(homeRes.status, 200);
+        const home = await homeRes.json();
+        assert.equal(home.connections.length, 2);
+
+        const [contoso, northwind] = home.connections;
+        assert.equal(contoso.organization, "contoso");
+        assert.equal(contoso.authRequired, undefined);
+        assert.equal(contoso.myWorkItems.workItems.length, 1);
+        assert.equal(contoso.myWorkItems.workItems[0].id, 101);
+
+        assert.equal(northwind.organization, "northwind");
+        assert.equal(northwind.authRequired?.tenantId, TENANT_DEVOPS_SECOND);
+        assert.equal(northwind.authRequired?.organization, "northwind");
+        assert.equal((await canvas.authStatus()).auth.isAuthenticated, true, "step-up MFA on a second tenant never signs out active tenants");
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});
+
+test("listOrganizations discovers B2B guest tenants via ARM and routes subsequent organization requests without a 401", async () => {
+    const stubs = discoveryStubs({ installed: false });
+    const { impl: execFileImpl } = execFileStub(() => assert.fail("unexpected AzureAuth invocation"));
+    const homeToken = makeSyntheticJwt({ tid: TENANT_HOME_M365 });
+    const armToken = makeSyntheticJwt({ tid: TENANT_HOME_M365, aud: "https://management.core.windows.net/" });
+    const b2bToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_B2B });
+    const secondToken = makeSyntheticJwt({ tid: TENANT_DEVOPS_SECOND });
+    const projectHeaders = [];
+
+    const namespace = await loadCanvasServer({
+        ...stubs,
+        execFileImpl,
+        browserTokenForTest: {
+            access_token: homeToken,
+            refresh_token: "family-refresh-token",
+            expires_in: 3600,
+        },
+        fetchImpl: async (url, options = {}) => {
+            const parsed = new URL(url);
+            if (parsed.host === "login.microsoftonline.com" && parsed.pathname.endsWith("/token")) {
+                const body = options.body instanceof URLSearchParams ? options.body : new URLSearchParams(String(options.body || ""));
+                if (String(body.get("scope") || "").includes("management.core.windows.net")) {
+                    return jsonStatusResponse(200, { access_token: armToken, refresh_token: "family-refresh-token", expires_in: 3600 });
+                }
+                if (parsed.pathname === `/${TENANT_DEVOPS_B2B}/oauth2/v2.0/token`) {
+                    return jsonStatusResponse(200, { access_token: b2bToken, refresh_token: "family-refresh-token", expires_in: 3600 });
+                }
+                if (parsed.pathname === `/${TENANT_DEVOPS_SECOND}/oauth2/v2.0/token`) {
+                    return jsonStatusResponse(200, { access_token: secondToken, refresh_token: "family-refresh-token", expires_in: 3600 });
+                }
+            }
+            if (parsed.host === "management.azure.com" && parsed.pathname === "/tenants") {
+                return jsonStatusResponse(200, {
+                    value: [
+                        { tenantId: TENANT_HOME_M365 },
+                        { tenantId: TENANT_DEVOPS_B2B },
+                        { tenantId: TENANT_DEVOPS_SECOND },
+                    ],
+                });
+            }
+            const auth = options.headers?.Authorization || "";
+            if (parsed.host === "app.vssps.visualstudio.com") {
+                if (parsed.pathname.endsWith("/_apis/profile/profiles/me")) {
+                    return jsonStatusResponse(200, { id: `member-${auth.slice(-6)}` });
+                }
+                if (parsed.pathname.endsWith("/_apis/accounts")) {
+                    if (auth === `Bearer ${homeToken}`) {
+                        // Default Office 365 tenant hosts zero Azure DevOps organizations.
+                        return jsonStatusResponse(200, { value: [] });
+                    }
+                    if (auth === `Bearer ${b2bToken}`) {
+                        return jsonStatusResponse(200, { value: [{ accountId: "a-1", accountName: "fabrikam" }] });
+                    }
+                    if (auth === `Bearer ${secondToken}`) {
+                        return jsonStatusResponse(200, { value: [{ accountId: "a-2", accountName: "adventureworks" }] });
+                    }
+                }
+            }
+            if (parsed.host === "dev.azure.com" && parsed.pathname === "/adventureworks/_apis/projects") {
+                projectHeaders.push(auth);
+                return jsonStatusResponse(200, { value: [{ id: "p-aw", name: "Bikes" }] });
+            }
+            if (parsed.host === "dev.azure.com" && parsed.pathname === "/fabrikam/_api/_common/identityImage") {
+                assert.equal(auth, `Bearer ${b2bToken}`, "avatar proxy routes with the connection organization's tenant token");
+                return new Response(RASTER_PNG, { status: 200, headers: { "Content-Type": "image/png" } });
+            }
+            return jsonStatusResponse(404, {});
+        },
+    });
+    const canvas = await startCanvas(namespace);
+    try {
+        const listed = await namespace.listOrganizations();
+        assert.equal(listed.error, "");
+        assert.deepEqual(
+            JSON.parse(JSON.stringify(listed.organizations)),
+            [
+                { name: "adventureworks", id: "a-2", tenantId: TENANT_DEVOPS_SECOND },
+                { name: "fabrikam", id: "a-1", tenantId: TENANT_DEVOPS_B2B },
+            ],
+        );
+
+        // Selecting adventureworks immediately sends TENANT_DEVOPS_SECOND's token without a 401 probe.
+        const projects = await authed(canvas, "/api/projects?organization=adventureworks").then((res) => res.json());
+        assert.deepEqual(projects.projects, [{ id: "p-aw", name: "Bikes" }]);
+        assert.deepEqual(projectHeaders, [`Bearer ${secondToken}`]);
+
+        // Image proxy for fabrikam uses TENANT_DEVOPS_B2B's token.
+        await authed(canvas, "/api/connection", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ organization: "fabrikam" }),
+        });
+        const avatarRes = await fetch(
+            `${canvas.base}/api/avatar?${new URLSearchParams({
+                organization: "fabrikam",
+                url: "https://dev.azure.com/fabrikam/_api/_common/identityImage?id=123",
+                nonce: canvas.apiNonce,
+            })}`,
+        );
+        assert.equal(avatarRes.status, 200);
+    } finally {
+        canvas.close();
+        rmSync(stubs.home, { recursive: true, force: true });
+    }
+});

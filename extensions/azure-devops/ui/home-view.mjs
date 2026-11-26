@@ -561,12 +561,30 @@ function connectionSections(connection, {
     onDelegateWorkItem,
     onOpenWorkItem,
     onChooseProject,
+    onAuthorizeTenant,
     showHeading,
 }) {
     const wrapper = element("div", "home-connection");
     const heading = connectionHeading(connection, { showHeading });
     if (heading) {
         wrapper.append(heading);
+    }
+
+    if (connection.authRequired) {
+        const authSection = section("Directory sign-in required", connection.organization || "");
+        authSection.append(statusCard(
+            connection.authRequired.message
+                || `Additional directory sign-in is required to access "${connection.organization}".`,
+            true,
+        ));
+        if (onAuthorizeTenant) {
+            const authorize = element("button", "secondary", "Sign in to directory");
+            authorize.type = "button";
+            authorize.addEventListener("click", () => onAuthorizeTenant(connection.authRequired, connection));
+            authSection.append(actionRow(authorize));
+        }
+        wrapper.append(authSection);
+        return wrapper;
     }
 
     const myPullRequests = connection.myPullRequests || {};

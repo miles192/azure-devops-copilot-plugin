@@ -21,6 +21,7 @@ function render(overrides = {}) {
     const host = document.createElement("section");
     const draftChanges = [];
     const committedOrganizations = [];
+    const authorizedTenants = [];
     const view = renderConnectionPanel(host, {
         draft: { organization: "Alpha", project: "", repositoryId: "", isDefault: false },
         organizations: ["Alpha", "Beta", "Gamma"],
@@ -30,11 +31,12 @@ function render(overrides = {}) {
     }, {
         onDraftChange: (change) => draftChanges.push(change),
         onOrganizationCommitted: (value) => committedOrganizations.push(value),
+        onAuthorizeTenant: (target) => authorizedTenants.push(target),
         onSave() {},
         onClearDefault() {},
         onCancel() {},
     });
-    return { host, view, draftChanges, committedOrganizations };
+    return { host, view, draftChanges, committedOrganizations, authorizedTenants };
 }
 
 test("an exact selection still opens the complete combobox option list", needsDom, () => {
@@ -82,4 +84,32 @@ test("the combobox supports keyboard selection", needsDom, () => {
 
     assert.equal(input.value, "Beta");
     assert.deepEqual(committedOrganizations, ["Beta"]);
+});
+
+test("a B2B organization requiring directory sign-in offers inline authorization without clearing the draft", needsDom, () => {
+    const challenge = {
+        tenantId: "22222222-2222-2222-2222-222222222222",
+        organization: "fabrikam",
+        message: 'Additional directory sign-in is required to access Azure DevOps organization "fabrikam".',
+    };
+    const { host, view, authorizedTenants } = render({
+        draft: { organization: "fabrikam", project: "", repositoryId: "", isDefault: false },
+        tenantAuthRequired: challenge,
+    });
+
+    const prompt = host.querySelector(".connection-auth-prompt");
+    assert.equal(prompt.hidden, false);
+    assert.match(prompt.textContent, /fabrikam/);
+
+    const button = prompt.querySelector("button");
+    assert.equal(button.textContent, "Sign in to directory");
+    button.click();
+    assert.deepEqual(authorizedTenants, [challenge]);
+    assert.equal(view.read().organization, "fabrikam", "the typed organization remains intact");
+
+    view.update({
+        draft: { organization: "fabrikam", project: "", repositoryId: "", isDefault: false },
+        tenantAuthRequired: null,
+    });
+    assert.equal(prompt.hidden, true);
 });

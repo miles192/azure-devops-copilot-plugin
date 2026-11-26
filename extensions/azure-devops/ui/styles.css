@@ -171,6 +171,11 @@ section { border: 1px solid var(--border-color-default, #d0d7de); border-radius:
 .connection-toggle { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; }
 .connection-toggle .connection-field-hint { grid-column: 2; }
 .connection-error { color: var(--fgColor-danger, #cf222e); font-size: var(--text-body-small, 12px); }
+.connection-auth-prompt { display: grid; gap: 8px; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 6px; padding: 10px 12px; background: var(--background-color-neutral-muted, rgba(127, 127, 127, .12)); font-size: var(--text-body-small, 12px); }
+.connection-auth-prompt-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.sign-in-tenant-details { font-size: var(--text-body-small, 12px); }
+.sign-in-tenant-summary { cursor: pointer; color: var(--text-color-muted, #57606a); user-select: none; }
+.sign-in-tenant-field { margin-top: 8px; }
 .connection-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 h1, h2, h3 { margin: 0; font-weight: var(--font-weight-semibold, 600); }
 h1 { font-size: var(--text-title-medium, 20px); line-height: var(--leading-title-medium, 26px); }
